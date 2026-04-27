@@ -1,9 +1,8 @@
 "use client";
 
-import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Sparkles } from "lucide-react";
-import { navigation } from "@/lib/navigation";
+import { NavTree } from "./NavTree";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -20,35 +19,8 @@ export function Sidebar() {
         </div>
       </div>
 
-      <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-1">
-        {navigation.map((item) => {
-          const isActive =
-            item.href === "/"
-              ? pathname === "/"
-              : pathname.startsWith(item.href);
-          const Icon = item.icon;
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={`group flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors ${
-                isActive
-                  ? "bg-accent-soft text-white"
-                  : "text-muted hover:bg-elevated hover:text-white"
-              }`}
-            >
-              <Icon
-                className={`h-4 w-4 flex-shrink-0 ${
-                  isActive ? "text-accent" : "text-muted group-hover:text-white"
-                }`}
-              />
-              <span className="truncate">{item.name}</span>
-              {isActive && (
-                <span className="ml-auto h-1.5 w-1.5 rounded-full bg-accent" />
-              )}
-            </Link>
-          );
-        })}
+      <nav className="flex-1 overflow-y-auto px-3 py-4">
+        <NavTree pathname={pathname} />
       </nav>
 
       <div className="border-t border-border px-4 py-4">

@@ -2,12 +2,12 @@ import { Image as ImageIcon, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Card, CardBody } from "@/components/Card";
 
-export default function PropertyImagesPage() {
+export default function ImageGeneratorPage() {
   return (
     <div className="space-y-8">
       <PageHeader
-        title="Property Images"
-        description="Generate, enhance, and organize visuals for property listings — from staging concepts to hero shots."
+        title="Image Generator"
+        description="Generate on-brand visuals for decks, listings, and social posts."
         icon={ImageIcon}
       />
 
