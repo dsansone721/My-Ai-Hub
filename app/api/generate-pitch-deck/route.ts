@@ -347,9 +347,12 @@ export async function POST(req: NextRequest) {
       const slide = pres.addSlide();
       addContentHeader(slide, "CAPITAL SPENT TO DATE");
       const items = [
-        { label: "Sponsor Funds Spent", value: inputs.sponsor_funds_spent },
-        { label: "Bridge Loan Drawn", value: inputs.bridge_loan_amount },
-        { label: "Total Spent to Date", value: inputs.sponsor_funds_spent + inputs.bridge_loan_amount },
+        { label: "Sponsor Funds Spent", value: fmt$(inputs.sponsor_funds_spent) },
+        { label: "Bridge Loan Drawn", value: fmt$(inputs.bridge_loan_amount) },
+        {
+          label: "Total Spent to Date",
+          value: fmt$(inputs.sponsor_funds_spent + inputs.bridge_loan_amount),
+        },
       ];
       addCenteredMetricRow(slide, items, 2.2);
       slide.addText(
@@ -618,12 +621,17 @@ export async function POST(req: NextRequest) {
       "_"
     )}_FACG_Pitch_Deck.pptx`;
 
-    return new NextResponse(buf, {
+    // Cast to BodyInit at the response boundary. Node Buffer is always backed
+    // by ArrayBuffer at runtime, but @types/node now types it as
+    // Buffer<ArrayBufferLike>, which TypeScript refuses to widen to BodyInit's
+    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
+    return new NextResponse(buf as unknown as BodyInit, {
       status: 200,
       headers: {
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": String(buf.byteLength),
         "Cache-Control": "no-store",
       },
     });

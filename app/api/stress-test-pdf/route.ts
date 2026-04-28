@@ -194,18 +194,16 @@ export async function POST(req: NextRequest) {
       .replace(/[^a-zA-Z0-9_-]/g, "_");
     const filename = `${safeName}_FACG_StressTest.pdf`;
 
-    const pdfBytes = new Uint8Array(
-      buffer.buffer,
-      buffer.byteOffset,
-      buffer.byteLength
-    );
-
-    return new NextResponse(pdfBytes, {
+    // Cast to BodyInit at the response boundary. Node Buffer is always backed
+    // by ArrayBuffer at runtime, but @types/node now types it as
+    // Buffer<ArrayBufferLike>, which TypeScript refuses to widen to BodyInit's
+    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
+    return new NextResponse(buffer as unknown as BodyInit, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${filename}"`,
-        "Content-Length": String(pdfBytes.byteLength),
+        "Content-Length": String(buffer.byteLength),
         "Cache-Control": "no-store",
       },
     });

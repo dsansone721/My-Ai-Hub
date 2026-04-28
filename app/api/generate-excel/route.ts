@@ -547,12 +547,17 @@ export async function POST(req: NextRequest) {
       "_"
     )}_FACG_Model.xlsx`;
 
-    return new NextResponse(buf, {
+    // Cast to BodyInit at the response boundary. exceljs returns a Node
+    // Buffer (always backed by ArrayBuffer at runtime), but TypeScript now
+    // types it as Buffer<ArrayBufferLike>, which won't widen to BodyInit's
+    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
+    return new NextResponse(buf as unknown as BodyInit, {
       status: 200,
       headers: {
         "Content-Type":
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": String(buf.byteLength),
         "Cache-Control": "no-store",
       },
     });

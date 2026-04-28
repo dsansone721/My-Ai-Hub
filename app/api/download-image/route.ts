@@ -42,15 +42,14 @@ export async function POST(req: NextRequest) {
 
     const contentType = upstream.headers.get("content-type") ?? "image/png";
     const arrayBuffer = await upstream.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuffer);
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
 
-    return new NextResponse(bytes, {
+    return new NextResponse(arrayBuffer, {
       status: 200,
       headers: {
         "Content-Type": contentType,
         "Content-Disposition": `attachment; filename="${safeName}"`,
-        "Content-Length": String(bytes.byteLength),
+        "Content-Length": String(arrayBuffer.byteLength),
         "Cache-Control": "no-store",
       },
     });

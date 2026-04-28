@@ -1510,20 +1510,16 @@ export async function POST(req: NextRequest) {
       "_"
     )}_FACG_Prospectus.pdf`;
 
-    // Convert Node Buffer to Uint8Array for an unambiguous BodyInit.
-    // (Node's Buffer extends Uint8Array but some Next.js paths reject it.)
-    const pdfBytes = new Uint8Array(
-      buffer.buffer,
-      buffer.byteOffset,
-      buffer.byteLength
-    );
-
-    return new NextResponse(pdfBytes, {
+    // Cast to BodyInit at the response boundary. Node Buffer is always backed
+    // by ArrayBuffer at runtime, but @types/node now types it as
+    // Buffer<ArrayBufferLike>, which TypeScript refuses to widen to BodyInit's
+    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
+    return new NextResponse(buffer as unknown as BodyInit, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${filename}"`,
-        "Content-Length": String(pdfBytes.byteLength),
+        "Content-Length": String(buffer.byteLength),
         "Cache-Control": "no-store",
       },
     });
