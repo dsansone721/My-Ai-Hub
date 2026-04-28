@@ -9,12 +9,10 @@ import {
   LineChart,
   BarChart3,
   FileText,
-  Presentation,
   Image as ImageIcon,
   Handshake,
   Home,
   MessageSquare,
-  FileSignature,
   Megaphone,
   Users,
   Tag,
@@ -26,6 +24,7 @@ import {
   Search,
   CalendarDays,
   LayoutDashboard,
+  Gauge,
   type LucideIcon,
 } from "lucide-react";
 
@@ -48,6 +47,15 @@ export type NavSection = {
   subsections: NavSubsection[];
 };
 
+export const topLevel: NavItem[] = [
+  {
+    name: "Dashboard",
+    href: "/dashboard",
+    description: "Overview of every tool in your hub.",
+    icon: LayoutDashboard,
+  },
+];
+
 export const sections: NavSection[] = [
   {
     name: "Work",
@@ -58,40 +66,28 @@ export const sections: NavSection[] = [
         icon: Building2,
         items: [
           {
-            name: "Financial Models",
-            href: "/financial-models",
-            description: "DCF, comps, three-statement, and LBO models.",
-            icon: LineChart,
+            name: "Deal Engine",
+            href: "/deal-tracker",
+            description: "End-to-end HUD deal pipeline — intake, comps, underwriting, stress test, and package generation.",
+            icon: Handshake,
           },
           {
-            name: "Comparables Analysis",
-            href: "/comparables-analysis",
-            description: "Build and compare peer multiples for any target.",
+            name: "Property Comparables",
+            href: "/property-comparables",
+            description: "HUD multifamily rent comp set with market analysis and underwriting insights.",
             icon: BarChart3,
           },
           {
-            name: "Investor Prospectus",
-            href: "/investor-prospectus",
-            description: "Draft polished prospectuses for investor review.",
-            icon: BookOpen,
+            name: "Stress Test Models",
+            href: "/stress-test-models",
+            description: "Run scenarios and stress tests across model assumptions.",
+            icon: Gauge,
           },
           {
-            name: "Pitch Decks",
-            href: "/pitch-decks",
-            description: "Generate and iterate on pitch deck narratives.",
-            icon: Presentation,
-          },
-          {
-            name: "Image Generator",
-            href: "/image-generator",
-            description: "Create on-brand visuals for decks and listings.",
+            name: "Renderings Generator",
+            href: "/renderings-generator",
+            description: "Generate property renderings and on-brand visuals for pitch decks and investor packages.",
             icon: ImageIcon,
-          },
-          {
-            name: "Deal Tracker",
-            href: "/deal-tracker",
-            description: "Track deals through sourcing, diligence, and close.",
-            icon: Handshake,
           },
         ],
       },
@@ -110,12 +106,6 @@ export const sections: NavSection[] = [
             href: "/tenant-outreach",
             description: "Draft tenant emails, follow-ups, and renewals.",
             icon: MessageSquare,
-          },
-          {
-            name: "Lease Summarizer",
-            href: "/lease-summarizer",
-            description: "Distill leases into key terms, dates, and risks.",
-            icon: FileSignature,
           },
           {
             name: "Social Marketing",
@@ -172,6 +162,18 @@ export const sections: NavSection[] = [
         icon: DollarSign,
         items: [
           {
+            name: "Financial Models",
+            href: "/financial-models",
+            description: "DCF, comps, three-statement, and LBO models.",
+            icon: LineChart,
+          },
+          {
+            name: "Earnings Summarizer",
+            href: "/earnings-summarizer",
+            description: "Distill earnings calls and reports into key takeaways.",
+            icon: FileText,
+          },
+          {
             name: "SIE Tutor",
             href: "/sie-tutor",
             description: "Practice questions and explanations for the SIE.",
@@ -207,21 +209,16 @@ export const sections: NavSection[] = [
             description: "On-demand weekly markets and macro briefing.",
             icon: CalendarDays,
           },
-          {
-            name: "Dashboard",
-            href: "/dashboard",
-            description: "Overview of every tool in your hub.",
-            icon: LayoutDashboard,
-          },
         ],
       },
     ],
   },
 ];
 
-export const allItems: NavItem[] = sections.flatMap((s) =>
-  s.subsections.flatMap((sub) => sub.items)
-);
+export const allItems: NavItem[] = [
+  ...topLevel,
+  ...sections.flatMap((s) => s.subsections.flatMap((sub) => sub.items)),
+];
 
 export function findItem(href: string): NavItem | undefined {
   return allItems.find((i) => i.href === href);

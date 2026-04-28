@@ -22,10 +22,21 @@ A personal Next.js workspace that bundles a set of AI-powered tools behind a sin
 
 ```bash
 npm install
+cp .env.local.example .env.local   # then add your ANTHROPIC_API_KEY
 npm run dev
 ```
 
 Then open [http://localhost:3000](http://localhost:3000).
+
+### Environment variables
+
+| Var | Used by | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Earnings Summarizer, Financial Models | Get one at [console.anthropic.com](https://console.anthropic.com/settings/keys). On Vercel, set it in **Project Settings → Environment Variables**. |
+
+The Financial Models tool pulls audited annual financials directly from SEC EDGAR via `fetch()` — no API key required and no rate caps. Ticker→CIK lookup uses [`company_tickers.json`](https://www.sec.gov/files/company_tickers.json); financial facts use [`data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`](https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json). SEC EDGAR covers US-registered issuers only and does not provide real-time prices — `current_price` and `upside_pct` will be `null`.
+
+Set `SEC_USER_AGENT` in `.env.local` to identify your client to the SEC (recommended for production traffic).
 
 ## Project structure
 

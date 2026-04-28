@@ -5,6 +5,7 @@ import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 import {
   sections,
+  topLevel,
   type NavSection,
   type NavSubsection,
   type NavItem,
@@ -31,6 +32,18 @@ type Props = {
 export function NavTree({ pathname, onNavigate }: Props) {
   return (
     <div className="space-y-1">
+      {topLevel.length > 0 && (
+        <div className="space-y-0.5 pb-2">
+          {topLevel.map((item) => (
+            <LeafLink
+              key={item.href}
+              item={item}
+              pathname={pathname}
+              onNavigate={onNavigate}
+            />
+          ))}
+        </div>
+      )}
       {sections.map((section) => (
         <SectionGroup
           key={section.name}
