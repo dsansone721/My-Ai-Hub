@@ -318,6 +318,17 @@ function isProspectusType(v: unknown): v is ProspectusType {
   return typeof v === "string" && (PROSPECTUS_TYPES as readonly string[]).includes(v);
 }
 
+// Module-load sanity check: every ProspectusType must have an addendum AND
+// a label entry. Failing loud at import time is much better than silently
+// producing a generic prospectus when a new audience is added later.
+for (const t of PROSPECTUS_TYPES) {
+  if (!PROSPECTUS_ADDENDA[t] || !PROSPECTUS_TYPE_LABELS[t]) {
+    throw new Error(
+      `[generate-prospectus] missing config for prospectus_type "${t}" — every type must have both an addendum and a label entry.`
+    );
+  }
+}
+
 type Body = {
   inputs?: DealInputs;
   underwriting?: UnderwritingResult | null;
@@ -1472,22 +1483,62 @@ function renderClose(p: PB, inputs: DealInputs) {
 // === POST handler ===
 
 export async function POST(req: NextRequest) {
+  // We do everything (validate, run Claude, build the PDF in memory) inside
+  // this single try block. Only AFTER the buffer is fully assembled do we
+  // return a Response — which guarantees that any error (validation, Claude,
+  // pdfkit, render-time exception) reaches the catch and returns a clean
+  // JSON { error } body. The previous streaming version committed
+  // Content-Type: application/pdf headers up-front, so a render error
+  // mid-stream produced a malformed download instead of a JSON error.
   try {
     const parsed = await req.json().catch(() => null);
     if (!parsed || typeof parsed !== "object") {
-      return jsonError("Invalid JSON body.", 400);
+      console.error("[generate-prospectus] body parse failed");
+      return jsonError("Request body was not valid JSON.", 400);
     }
     const body = parsed as Body;
     const inputs = body.inputs;
-    if (!inputs) return jsonError("Missing 'inputs'.", 400);
+    if (!inputs || typeof inputs !== "object") {
+      console.error("[generate-prospectus] missing inputs in body");
+      return jsonError("Missing 'inputs' in request body.", 400);
+    }
 
-    // Default to senior_debt when omitted — that's the legacy single-button
-    // behavior, and senior debt is the most common first-touch audience.
-    const prospectusType: ProspectusType = isProspectusType(body.prospectus_type)
-      ? body.prospectus_type
-      : "senior_debt";
+    // Strict validation of prospectus_type. Missing → default to senior_debt.
+    // Present-but-invalid → 400 with the list of valid options. We don't
+    // silently coerce a bad value, because the analyst would otherwise get
+    // an unexpected (Senior Debt) PDF when they asked for, say, "mezzanine".
+    let prospectusType: ProspectusType;
+    if (body.prospectus_type === undefined || body.prospectus_type === null) {
+      prospectusType = "senior_debt";
+    } else if (isProspectusType(body.prospectus_type)) {
+      prospectusType = body.prospectus_type;
+    } else {
+      console.error(
+        "[generate-prospectus] invalid prospectus_type:",
+        body.prospectus_type
+      );
+      return jsonError(
+        `Invalid prospectus_type. Got ${JSON.stringify(body.prospectus_type)}; expected one of: ${PROSPECTUS_TYPES.join(", ")}.`,
+        400
+      );
+    }
+
     const typeLabels = PROSPECTUS_TYPE_LABELS[prospectusType];
-    const fullSystemPrompt = `${SYSTEM_PROMPT}\n\n${PROSPECTUS_ADDENDA[prospectusType]}`;
+    const addendum = PROSPECTUS_ADDENDA[prospectusType];
+    if (!typeLabels || !addendum) {
+      // Defense in depth — the module-load sanity check should already have
+      // caught this, but if a future refactor breaks the mapping we'd rather
+      // hard-fail with a clear JSON error than ship a misformatted PDF.
+      console.error(
+        "[generate-prospectus] config lookup failed for:",
+        prospectusType
+      );
+      return jsonError(
+        `Server config error: no labels/addendum for prospectus_type "${prospectusType}".`,
+        500
+      );
+    }
+    const fullSystemPrompt = `${SYSTEM_PROMPT}\n\n${addendum}`;
 
     const computed = body.underwriting?.computed ?? computeMetrics(inputs);
     // Total capital raise = authoritative S&U sources total (extracted or
@@ -1498,7 +1549,14 @@ export async function POST(req: NextRequest) {
       computed.total_project_cost;
 
     // === Generate narrative via Claude (with fallback) ===
+    //
+    // We intentionally swallow Claude failures and fall back to the default
+    // narrative — the user still gets a usable PDF. But every failure path
+    // is logged with the audience + project context so we can diagnose
+    // rate limits, auth issues, and timeouts after the fact.
+    const logCtx = `[generate-prospectus] type=${prospectusType} project="${inputs.project_name || "(unnamed)"}"`;
     let narrative: Narrative = defaultNarrative(inputs);
+    let claudeFallback: string | null = null;
     if (process.env.ANTHROPIC_API_KEY) {
       try {
         const client = new Anthropic();
@@ -1523,41 +1581,86 @@ export async function POST(req: NextRequest) {
           ``,
           `Generate the prospectus narrative JSON for the ${typeLabels.coverLabel.toLowerCase()} audience.`,
         ].join("\n");
-        const response = await client.messages.create({
-          model: MODEL,
-          max_tokens: 8192,
-          system: fullSystemPrompt,
-          messages: [{ role: "user", content: userPrompt }],
-        });
+        const response = await client.messages.create(
+          {
+            model: MODEL,
+            max_tokens: 8192,
+            system: fullSystemPrompt,
+            messages: [{ role: "user", content: userPrompt }],
+          },
+          { timeout: 90_000 }
+        );
+        if (response.stop_reason === "max_tokens") {
+          console.warn(
+            `${logCtx} Claude hit max_tokens — narrative likely truncated.`
+          );
+        }
         const rawText = response.content
           .filter((b) => b.type === "text")
           .map((b) => (b as { type: "text"; text: string }).text)
           .join("");
-        if (rawText.trim()) {
+        if (!rawText.trim()) {
+          claudeFallback = `empty response (stop_reason: ${response.stop_reason})`;
+        } else {
           try {
-            const parsed = JSON.parse(extractJson(rawText)) as Partial<Narrative>;
-            narrative = mergeNarrative(defaultNarrative(inputs), parsed);
+            const parsedNarrative = JSON.parse(
+              extractJson(rawText)
+            ) as Partial<Narrative>;
+            narrative = mergeNarrative(defaultNarrative(inputs), parsedNarrative);
           } catch (parseErr) {
+            claudeFallback = "JSON parse failed";
             console.error(
-              "[generate-prospectus] Claude JSON parse failed; using default narrative:",
-              parseErr
+              `${logCtx} Claude JSON parse failed; using default narrative.`,
+              {
+                parseErr:
+                  parseErr instanceof Error ? parseErr.message : String(parseErr),
+                rawHead: rawText.slice(0, 500),
+              }
             );
           }
         }
       } catch (claudeErr) {
+        // Categorise the failure so the operator can grep the logs cleanly.
+        if (claudeErr instanceof Anthropic.AuthenticationError) {
+          claudeFallback = "invalid ANTHROPIC_API_KEY";
+        } else if (claudeErr instanceof Anthropic.RateLimitError) {
+          claudeFallback = "rate-limited";
+        } else if (claudeErr instanceof Anthropic.APIConnectionTimeoutError) {
+          claudeFallback = "Anthropic timeout (>90s)";
+        } else if (claudeErr instanceof Anthropic.APIError) {
+          claudeFallback = `Anthropic API error (${claudeErr.status ?? "unknown"})`;
+        } else {
+          claudeFallback =
+            claudeErr instanceof Error ? claudeErr.message : "unknown error";
+        }
         console.error(
-          "[generate-prospectus] Claude failed; using default narrative:",
+          `${logCtx} Claude failed (${claudeFallback}); falling back to default narrative.`,
           claudeErr
         );
       }
+    } else {
+      claudeFallback = "ANTHROPIC_API_KEY not configured";
+      console.warn(`${logCtx} ${claudeFallback} — using default narrative.`);
+    }
+    if (claudeFallback) {
+      console.warn(`${logCtx} narrative fallback reason: ${claudeFallback}`);
     }
 
     // === Build PDF ===
     // Dynamic import keeps pdfkit out of webpack's bundle so its .afm font
     // files load correctly from node_modules at runtime. Combined with
     // serverComponentsExternalPackages: ['pdfkit'] in next.config.js.
-    const pdfkitModule = await import("pdfkit");
-    const PDFDocument = (pdfkitModule.default ?? pdfkitModule) as PDFCtor;
+    let PDFDocument: PDFCtor;
+    try {
+      const pdfkitModule = await import("pdfkit");
+      PDFDocument = (pdfkitModule.default ?? pdfkitModule) as PDFCtor;
+    } catch (importErr) {
+      console.error(`${logCtx} pdfkit import failed.`, importErr);
+      return jsonError(
+        "Server failed to load the PDF generator. Check that pdfkit is installed.",
+        500
+      );
+    }
 
     const safeProject = (inputs.project_name || "Deal").replace(
       /[^a-zA-Z0-9_-]/g,
@@ -1565,36 +1668,37 @@ export async function POST(req: NextRequest) {
     );
     const filename = `${safeProject}_FACG_${typeLabels.filenameSlug}_Prospectus.pdf`;
 
-    // === Stream the PDF binary directly to the client ===
-    // We don't accumulate the full PDF in a Node Buffer anymore. As soon as
-    // pdfkit's underlying writable starts emitting chunks (during end()'s
-    // flushPages pass), they're enqueued onto the response stream and the
-    // browser's "Save As" dialog pops as soon as the first byte lands.
+    // === Build the PDF fully in memory, then return as a buffered response ===
     //
-    // Note: with bufferPages: true (which we need for cross-page footer
-    // numbering), pdfkit holds bytes until end() — so streaming here gives
-    // memory and first-byte-latency wins, NOT a Vercel-timeout fix.
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
+    // Why buffered (and not streamed): if any render function throws — bad
+    // input shape, pdfkit table overflow, font lookup failure — we need the
+    // error to reach the outer catch so it can return a JSON { error: ... }.
+    // A streaming response would already have committed
+    // Content-Type: application/pdf headers, and the client would receive a
+    // truncated download rather than a clean error message. Buffering trades
+    // a small first-byte-latency win for guaranteed JSON error semantics.
+    let pdfBuffer: Buffer;
+    try {
+      pdfBuffer = await new Promise<Buffer>((resolve, reject) => {
         const p = new PB(PDFDocument);
+        const chunks: Buffer[] = [];
+        let settled = false;
+        const settleReject = (err: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        };
+        const settleResolve = (buf: Buffer) => {
+          if (settled) return;
+          settled = true;
+          resolve(buf);
+        };
 
-        p.doc.on("data", (chunk: Buffer) => {
-          // Convert Buffer view into a fresh Uint8Array<ArrayBuffer> the
-          // ReadableStream controller will accept. The .slice() copy is
-          // unavoidable: pdfkit reuses its internal buffer between writes.
-          controller.enqueue(
-            new Uint8Array(
-              chunk.buffer.slice(
-                chunk.byteOffset,
-                chunk.byteOffset + chunk.byteLength
-              ) as ArrayBuffer
-            )
-          );
-        });
-        p.doc.on("end", () => controller.close());
+        p.doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+        p.doc.on("end", () => settleResolve(Buffer.concat(chunks)));
         p.doc.on("error", (err: Error) => {
-          console.error("[generate-prospectus] pdfkit error:", err);
-          controller.error(err);
+          console.error(`${logCtx} pdfkit emitted error:`, err);
+          settleReject(err);
         });
 
         try {
@@ -1642,30 +1746,53 @@ export async function POST(req: NextRequest) {
           // Decorate (footer + watermark) on every page
           p.decorateAllPages(true);
 
-          // Triggers the data → end event chain that drives the stream.
+          // Triggers the data → end event chain that drives the buffer.
           p.doc.end();
         } catch (err) {
-          console.error("[generate-prospectus] render failed:", err);
-          controller.error(err);
+          // Synchronous render-time error — log, then reject so the outer
+          // try/catch returns a proper JSON 500 instead of an empty PDF.
+          console.error(`${logCtx} render-time exception:`, err);
+          settleReject(
+            err instanceof Error ? err : new Error(String(err))
+          );
         }
-      },
-    });
+      });
+    } catch (renderErr) {
+      const m =
+        renderErr instanceof Error ? renderErr.message : String(renderErr);
+      console.error(`${logCtx} PDF generation failed: ${m}`);
+      return jsonError(`PDF generation failed: ${m}`, 500);
+    }
 
-    return new Response(stream, {
+    if (!pdfBuffer || pdfBuffer.byteLength === 0) {
+      console.error(`${logCtx} pdfkit produced an empty buffer.`);
+      return jsonError("PDF generation produced an empty file.", 500);
+    }
+
+    // Cast to BodyInit at the response boundary. Node Buffer is always backed
+    // by ArrayBuffer at runtime, but @types/node now types it as
+    // Buffer<ArrayBufferLike>, which TypeScript refuses to widen to BodyInit's
+    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
+    return new NextResponse(pdfBuffer as unknown as BodyInit, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${filename}"`,
-        // Content-Length is intentionally omitted — we don't know the final
-        // byte count up front when streaming. Browsers handle this fine and
-        // show progress as bytes arrive.
+        "Content-Length": String(pdfBuffer.byteLength),
         "Cache-Control": "no-store",
       },
     });
   } catch (err) {
-    console.error("[generate-prospectus] unhandled:", err);
-    const m = err instanceof Error ? err.message : "Unknown server error";
-    return jsonError(m, 500);
+    // Catch-all safety net. Any throw — including non-Error throws like raw
+    // strings or rejected non-Error promises — gets converted to a clean JSON
+    // 500 with a stack trace in the server log. This is the boundary that
+    // guarantees the client never receives a non-JSON error body.
+    const detail =
+      err instanceof Error
+        ? `${err.name}: ${err.message}`
+        : `Non-Error throw: ${typeof err === "string" ? err : JSON.stringify(err)}`;
+    console.error("[generate-prospectus] UNHANDLED:", detail, err);
+    return jsonError(`Unexpected server error: ${detail}`, 500);
   }
 }
 
