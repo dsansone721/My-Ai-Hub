@@ -3,7 +3,12 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { ExtractedSourcesUses, IntakeReport } from "@/lib/deal-tracker/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+// 60s matches Vercel Hobby's hard cap. Setting it higher (e.g. 120) lets the
+// function THINK it has more time and exceed the platform limit, at which
+// point Vercel kills the request and replaces our JSON body with a generic
+// "An error occurred" gateway page. Keeping it at 60 means our try/catch
+// returns a clean JSON error before the platform interferes.
+export const maxDuration = 60;
 
 const MODEL = "claude-sonnet-4-6";
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB per file
@@ -214,6 +219,23 @@ function imageMediaType(file: File): ImageMediaType {
 }
 
 async function buildContentForFile(file: File): Promise<FileBlock> {
+  // Outer wrapper: anything thrown here becomes a structured `kind: "error"`
+  // block rather than a thrown exception. The intake route has its own loop
+  // catch on top of this (defense in depth), but keeping every parsing path
+  // in a single guarded function makes the error messages consistent.
+  try {
+    return await buildContentForFileInner(file);
+  } catch (err) {
+    const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    console.error(`[intake] buildContentForFile threw on "${file.name}":`, detail, err);
+    return {
+      kind: "error",
+      message: `${file.name}: extraction failed (${detail}).`,
+    };
+  }
+}
+
+async function buildContentForFileInner(file: File): Promise<FileBlock> {
   const kind = classify(file);
   if (!kind) {
     return {
@@ -247,8 +269,29 @@ async function buildContentForFile(file: File): Promise<FileBlock> {
       if (!text) return { kind: "error", message: `${file.name}: empty Word doc.` };
       return { kind: "text", text, sourceName: file.name };
     } catch (err) {
-      console.error("[intake] mammoth failed:", err);
-      return { kind: "error", message: `${file.name}: could not parse Word document.` };
+      // Fallback: a .docx is a zip of XML. Even without mammoth we can scrape
+      // the <w:t>…</w:t> text spans from the raw bytes (same trick we use for
+      // .pptx <a:t>). It loses formatting but preserves the analyst's prose,
+      // which is what Claude actually needs.
+      console.error(`[intake] mammoth unavailable on "${file.name}":`, err);
+      const text = buffer.toString("utf-8");
+      const matches = Array.from(text.matchAll(/<w:t[^>]*>([^<]+)<\/w:t>/g))
+        .map((m) => m[1])
+        .filter((s) => s && s.trim().length > 0);
+      if (matches.length === 0) {
+        return {
+          kind: "error",
+          message: `${file.name}: could not parse Word document (mammoth failed and raw scrape found no text).`,
+        };
+      }
+      console.warn(
+        `[intake] using raw <w:t> scrape fallback for "${file.name}" (${matches.length} spans).`
+      );
+      return {
+        kind: "text",
+        text: matches.join("\n"),
+        sourceName: file.name,
+      };
     }
   }
   if (kind === "xlsx") {
@@ -271,8 +314,29 @@ async function buildContentForFile(file: File): Promise<FileBlock> {
           : sheetsText;
       return { kind: "text", text: capped, sourceName: file.name };
     } catch (err) {
-      console.error("[intake] xlsx failed:", err);
-      return { kind: "error", message: `${file.name}: could not parse Excel workbook.` };
+      // Fallback: scrape inline strings + shared-strings text from the raw
+      // .xlsx ZIP bytes. This loses cell positions but keeps labels and
+      // values together so Claude can still triage. Better than nothing.
+      console.error(`[intake] xlsx unavailable on "${file.name}":`, err);
+      const text = buffer.toString("utf-8");
+      const matches = Array.from(text.matchAll(/<t[^>]*>([^<]+)<\/t>/g))
+        .map((m) => m[1])
+        .filter((s) => s && s.trim().length > 0);
+      if (matches.length === 0) {
+        return {
+          kind: "error",
+          message: `${file.name}: could not parse Excel workbook (xlsx failed and raw scrape found no strings).`,
+        };
+      }
+      console.warn(
+        `[intake] using raw <t> scrape fallback for "${file.name}" (${matches.length} cells).`
+      );
+      const joined = matches.join(" · ");
+      const capped =
+        joined.length > MAX_XLSX_TEXT
+          ? joined.slice(0, MAX_XLSX_TEXT) + " [… truncated …]"
+          : joined;
+      return { kind: "text", text: capped, sourceName: file.name };
     }
   }
   if (kind === "pptx") {
@@ -445,15 +509,31 @@ export type IntakeResponse = {
 // =====================================================================
 
 export async function POST(req: NextRequest) {
+  // A request-scoped log prefix so concurrent intakes are easy to distinguish
+  // when scanning Vercel logs. Random short tag — not a real correlation id.
+  const reqTag = Math.random().toString(36).slice(2, 8);
+  const logPrefix = `[intake ${reqTag}]`;
+
+  // The whole handler is wrapped in this try/catch. ANY throw — sync or
+  // async, Error or non-Error, from validation or Claude or file parsing —
+  // ends up here and produces a JSON { error } body. The only way the
+  // client can see a non-JSON response is if Vercel kills the function for
+  // exceeding the platform timeout (which is why maxDuration is 60).
   try {
+    console.log(
+      `${logPrefix} received request — ${new Date().toISOString()}`
+    );
+
     if (!process.env.ANTHROPIC_API_KEY) {
+      console.error(`${logPrefix} ANTHROPIC_API_KEY missing`);
       return jsonError("ANTHROPIC_API_KEY is not configured on the server.", 500);
     }
 
     let formData: FormData;
     try {
       formData = await req.formData();
-    } catch {
+    } catch (formErr) {
+      console.error(`${logPrefix} formData parse failed:`, formErr);
       return jsonError("Expected multipart/form-data.", 400);
     }
 
@@ -519,37 +599,59 @@ export async function POST(req: NextRequest) {
     }
 
     for (const file of files) {
-      const piece = await buildContentForFile(file);
-      if (piece.kind === "error") {
-        errors.push(piece.message);
-        continue;
-      }
-      if (piece.kind === "pdf") {
-        userContent.push({
-          type: "document",
-          source: { type: "base64", media_type: piece.mediaType, data: piece.data },
-        });
-        userContent.push({
-          type: "text",
-          text: `(PDF source: ${piece.sourceName})`,
-        });
-        filesProcessed.push(piece.sourceName);
-      } else if (piece.kind === "image") {
-        userContent.push({
-          type: "image",
-          source: { type: "base64", media_type: piece.mediaType, data: piece.data },
-        });
-        userContent.push({
-          type: "text",
-          text: `(Image source: ${piece.sourceName} — extract any visible text/data)`,
-        });
-        filesProcessed.push(piece.sourceName);
-      } else {
-        userContent.push({
-          type: "text",
-          text: `=== FILE: ${piece.sourceName} ===\n${piece.text}`,
-        });
-        filesProcessed.push(piece.sourceName);
+      // Each file is processed inside its own try so a single bad/corrupt
+      // file (or a synchronous throw from a parser library that wasn't
+      // caught by buildContentForFile's internal handlers — e.g., a missing
+      // dependency on Vercel) doesn't kill the whole intake. Whatever fails
+      // gets logged and surfaced as a per-file error message in `notes`,
+      // and we continue with the rest of the upload.
+      try {
+        const piece = await buildContentForFile(file);
+        if (piece.kind === "error") {
+          console.warn(`[intake] file "${file.name}" extraction error:`, piece.message);
+          errors.push(piece.message);
+          continue;
+        }
+        if (piece.kind === "pdf") {
+          userContent.push({
+            type: "document",
+            source: { type: "base64", media_type: piece.mediaType, data: piece.data },
+          });
+          userContent.push({
+            type: "text",
+            text: `(PDF source: ${piece.sourceName})`,
+          });
+          filesProcessed.push(piece.sourceName);
+        } else if (piece.kind === "image") {
+          userContent.push({
+            type: "image",
+            source: { type: "base64", media_type: piece.mediaType, data: piece.data },
+          });
+          userContent.push({
+            type: "text",
+            text: `(Image source: ${piece.sourceName} — extract any visible text/data)`,
+          });
+          filesProcessed.push(piece.sourceName);
+        } else {
+          userContent.push({
+            type: "text",
+            text: `=== FILE: ${piece.sourceName} ===\n${piece.text}`,
+          });
+          filesProcessed.push(piece.sourceName);
+        }
+      } catch (fileErr) {
+        // Truly unexpected — buildContentForFile is supposed to swallow its
+        // own errors. If we get here, log everything we know and keep going.
+        const detail =
+          fileErr instanceof Error
+            ? `${fileErr.name}: ${fileErr.message}`
+            : String(fileErr);
+        console.error(
+          `[intake] file "${file.name}" threw during extraction:`,
+          detail,
+          fileErr
+        );
+        errors.push(`${file.name}: extraction threw (${detail}).`);
       }
     }
 
@@ -574,11 +676,16 @@ export async function POST(req: NextRequest) {
           system: SYSTEM_PROMPT,
           messages: [{ role: "user", content: userContent }],
         },
-        // Hard request timeout — fail clearly before Vercel's hard kill.
-        { timeout: 90_000 }
+        // 50s SDK timeout sits inside the 60s function cap with ~10s of
+        // headroom to (a) finish the response body and (b) return JSON.
+        // If we used 90s here Vercel would kill the function at 60s and
+        // replace our JSON with the platform's plain-text gateway error.
+        { timeout: 50_000 }
       );
     } catch (err) {
-      console.error("[intake] Anthropic call failed:", err);
+      const errName = err instanceof Error ? err.name : "non-error";
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`${logPrefix} Anthropic call failed (${errName}):`, errMsg, err);
       if (err instanceof Anthropic.AuthenticationError) {
         return jsonError("Invalid ANTHROPIC_API_KEY.", 401);
       }
@@ -587,7 +694,7 @@ export async function POST(req: NextRequest) {
       }
       if (err instanceof Anthropic.APIConnectionTimeoutError) {
         return jsonError(
-          "Anthropic took too long to respond. Try again — intake usually returns in under 60 seconds.",
+          "Anthropic took too long to respond. Try again with fewer / smaller files.",
           504
         );
       }
@@ -597,8 +704,7 @@ export async function POST(req: NextRequest) {
           502
         );
       }
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return jsonError(`Anthropic call failed: ${message}`, 502);
+      return jsonError(`Anthropic call failed: ${errMsg}`, 502);
     }
 
     const rawText = response.content
@@ -606,6 +712,9 @@ export async function POST(req: NextRequest) {
       .map((b) => (b as { type: "text"; text: string }).text)
       .join("");
     if (!rawText.trim()) {
+      console.error(
+        `${logPrefix} empty Claude response — stop_reason: ${response.stop_reason}`
+      );
       return jsonError(
         `The model returned no text (stop_reason: ${response.stop_reason}).`,
         502
@@ -615,11 +724,17 @@ export async function POST(req: NextRequest) {
     let parsed: unknown;
     try {
       parsed = JSON.parse(extractJson(rawText));
-    } catch {
-      console.error("[intake] JSON parse failed. Raw:\n", rawText.slice(0, 2000));
+    } catch (parseErr) {
+      console.error(
+        `${logPrefix} Claude JSON parse failed:`,
+        parseErr,
+        "\nRaw response head:\n",
+        rawText.slice(0, 2000)
+      );
       return jsonError("The model returned a response that wasn't valid JSON.", 502);
     }
     if (!parsed || typeof parsed !== "object") {
+      console.error(`${logPrefix} Claude response was not an object:`, typeof parsed);
       return jsonError("Intake response was not an object.", 502);
     }
     const obj = parsed as {
@@ -647,10 +762,24 @@ export async function POST(req: NextRequest) {
       notes: notes.trim(),
       filesProcessed: filesProcessed.length,
     };
+    console.log(
+      `${logPrefix} success — files: ${filesProcessed.length}, found: ${report.found.length}, conflicts: ${report.conflicts.length}, questions: ${report.questions.length}`
+    );
     return NextResponse.json(result);
   } catch (err) {
-    console.error("[intake] unhandled:", err);
-    const message = err instanceof Error ? err.message : "Unknown server error";
-    return jsonError(message, 500);
+    // The catch-all. Anything that escaped the per-step error handlers above
+    // — including non-Error throws like a raw string, a rejected non-Error
+    // promise, or a synchronous module-init failure — gets converted to a
+    // clean JSON 500 here. Logs include the error name AND stack so the
+    // actual cause is visible in Vercel's function logs.
+    if (err instanceof Error) {
+      console.error(
+        `${logPrefix} UNHANDLED ${err.name}: ${err.message}\n${err.stack ?? "(no stack)"}`
+      );
+      return jsonError(`Unexpected server error: ${err.message}`, 500);
+    }
+    const detail = typeof err === "string" ? err : JSON.stringify(err);
+    console.error(`${logPrefix} UNHANDLED non-error throw:`, detail);
+    return jsonError(`Unexpected server error: ${detail}`, 500);
   }
 }
