@@ -152,18 +152,31 @@ export async function POST(req: NextRequest) {
     const client = new Anthropic();
     let response;
     try {
-      response = await client.messages.create({
-        model: MODEL,
-        max_tokens: 8192,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userPrompt }],
-      });
+      response = await client.messages.create(
+        {
+          model: MODEL,
+          // 8192 was overkill — a typical comp set is 5 comps + market summary
+          // narrative, easily fits in 3000 tokens. Lower cap = lower wall-clock
+          // ceiling, which keeps us comfortably under Vercel's 60s function cap.
+          max_tokens: 3000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userPrompt }],
+        },
+        // Hard request timeout — fail fast (502) instead of letting the
+        // function ride to Vercel's hard 60s kill where the user gets nothing.
+        { timeout: 45_000 }
+      );
     } catch (err) {
       console.error("[comparables] Anthropic call failed:", err);
       if (err instanceof Anthropic.AuthenticationError)
         return jsonError("Invalid ANTHROPIC_API_KEY.", 401);
       if (err instanceof Anthropic.RateLimitError)
         return jsonError("Rate limited by Anthropic. Try again.", 429);
+      if (err instanceof Anthropic.APIConnectionTimeoutError)
+        return jsonError(
+          "Anthropic took too long to respond. Try again — comps usually return in under 30 seconds.",
+          504
+        );
       if (err instanceof Anthropic.APIError)
         return jsonError(`Anthropic API error: ${err.message}`, 502);
       const m = err instanceof Error ? err.message : "Unknown error";

@@ -268,12 +268,20 @@ export async function POST(req: NextRequest) {
 
       try {
         const client = new Anthropic();
-        const response = await client.messages.create({
-          model: MODEL,
-          max_tokens: 4096,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: userPrompt }],
-        });
+        const response = await client.messages.create(
+          {
+            model: MODEL,
+            // S&U refinement + 2-4 sentence narrative is small — 2048 tokens
+            // is plenty and tightens the wall-clock ceiling. Lower cap means
+            // we stay well under Vercel's 60s function-duration hard kill.
+            max_tokens: 2048,
+            system: SYSTEM_PROMPT,
+            messages: [{ role: "user", content: userPrompt }],
+          },
+          // Hard request timeout — if Anthropic is slow today we'd rather
+          // fall back to the deterministic server defaults than hang to 60s.
+          { timeout: 45_000 }
+        );
         const rawText = response.content
           .filter((b) => b.type === "text")
           .map((b) => (b as { type: "text"; text: string }).text)

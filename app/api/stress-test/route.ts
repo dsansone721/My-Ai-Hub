@@ -142,138 +142,150 @@ export type StressTestResponse = {
   };
 };
 
-/**
- * Strip a single set of leading/trailing markdown code fences if Claude
- * accidentally wraps the document despite the instruction not to.
- */
-function unwrapFences(text: string): string {
-  const trimmed = text.trim();
-  const fence = /^```(?:[a-zA-Z0-9_-]*)\s*\n([\s\S]*?)\n```$/;
-  const m = trimmed.match(fence);
-  return m ? m[1].trim() : trimmed;
-}
-
 export async function POST(req: NextRequest) {
-  try {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return jsonError("ANTHROPIC_API_KEY is not configured on the server.", 500);
-    }
-
-    let formData: FormData;
-    try {
-      formData = await req.formData();
-    } catch {
-      return jsonError("Expected multipart/form-data with a 'file' field.", 400);
-    }
-
-    const item = formData.get("file");
-    if (!(item instanceof File) || item.size === 0) {
-      return jsonError("Upload an .xlsx file in the 'file' field.", 400);
-    }
-    if (item.size > MAX_FILE_SIZE_BYTES) {
-      return jsonError(
-        `File too large (${(item.size / 1024 / 1024).toFixed(1)} MB). Max ${MAX_FILE_SIZE_BYTES / 1024 / 1024} MB.`,
-        413
-      );
-    }
-
-    const name = item.name.toLowerCase();
-    if (!/\.xlsx?$/i.test(name)) {
-      return jsonError("Only Excel (.xlsx, .xls) workbooks are supported.", 400);
-    }
-
-    let workbookText: string;
-    let sheetCount: number;
-    try {
-      const parsed = await readWorkbook(item);
-      workbookText = parsed.text;
-      sheetCount = parsed.sheetCount;
-    } catch (err) {
-      console.error("[stress-test] xlsx parse failed:", err);
-      return jsonError(
-        "Could not parse the workbook. Save as .xlsx (Excel 2007+) and try again.",
-        400
-      );
-    }
-
-    if (!workbookText.trim()) {
-      return jsonError("The workbook appears to be empty.", 400);
-    }
-
-    const userPrompt = [
-      `## Source workbook`,
-      `File: ${item.name}`,
-      `Sheets: ${sheetCount}`,
-      ``,
-      `## Workbook contents (CSV per sheet, formulas preserved where readable)`,
-      workbookText,
-      ``,
-      `Stress test, audit, and write the markdown report following the exact section structure in your instructions.`,
-    ].join("\n");
-
-    const client = new Anthropic();
-    let response;
-    try {
-      response = await client.messages.create({
-        model: MODEL,
-        // A full 6-section report (assumption table, multiple stress scenarios,
-        // ranked red flags, 10 deep analyst questions, memo summary) regularly
-        // runs 5-12k tokens. 8192 was clipping the tail of Section 5 mid-question.
-        max_tokens: 16000,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userPrompt }],
-      });
-    } catch (err) {
-      console.error("[stress-test] Anthropic call failed:", err);
-      if (err instanceof Anthropic.AuthenticationError) {
-        return jsonError("Invalid ANTHROPIC_API_KEY.", 401);
-      }
-      if (err instanceof Anthropic.RateLimitError) {
-        return jsonError("Rate limited by Anthropic. Try again in a moment.", 429);
-      }
-      if (err instanceof Anthropic.APIError) {
-        return jsonError(
-          `Anthropic API error (${err.status ?? "unknown"}): ${err.message}`,
-          502
-        );
-      }
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return jsonError(`Anthropic call failed: ${message}`, 502);
-    }
-
-    const rawText = response.content
-      .filter((b) => b.type === "text")
-      .map((b) => (b as { type: "text"; text: string }).text)
-      .join("");
-
-    if (!rawText.trim()) {
-      return jsonError(
-        `The model returned no text (stop_reason: ${response.stop_reason}).`,
-        502
-      );
-    }
-
-    // If Claude actually ran out of room (stop_reason === "max_tokens"),
-    // log it so we know to bump the cap further. The PDF will still render
-    // whatever was returned — this is a warning, not a failure.
-    if (response.stop_reason === "max_tokens") {
-      console.warn(
-        "[stress-test] Claude hit max_tokens cap — report likely truncated. Increase max_tokens."
-      );
-    }
-
-    const result: StressTestResponse = {
-      report_markdown: unwrapFences(rawText),
-      meta: {
-        file_name: item.name,
-        sheet_count: sheetCount,
-        analyzed_at: new Date().toISOString(),
-      },
-    };
-    return NextResponse.json(result);
-  } catch (err) {
-    console.error("[stress-test] unhandled:", err);
-    const message = err instanceof Error ? err.message : "Unknown server error";
-    return jsonError(message, 500);
+  // === Synchronous validation — these errors can still go back as JSON ===
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return jsonError("ANTHROPIC_API_KEY is not configured on the server.", 500);
   }
+
+  let formData: FormData;
+  try {
+    formData = await req.formData();
+  } catch {
+    return jsonError("Expected multipart/form-data with a 'file' field.", 400);
+  }
+
+  const item = formData.get("file");
+  if (!(item instanceof File) || item.size === 0) {
+    return jsonError("Upload an .xlsx file in the 'file' field.", 400);
+  }
+  if (item.size > MAX_FILE_SIZE_BYTES) {
+    return jsonError(
+      `File too large (${(item.size / 1024 / 1024).toFixed(1)} MB). Max ${MAX_FILE_SIZE_BYTES / 1024 / 1024} MB.`,
+      413
+    );
+  }
+
+  const name = item.name.toLowerCase();
+  if (!/\.xlsx?$/i.test(name)) {
+    return jsonError("Only Excel (.xlsx, .xls) workbooks are supported.", 400);
+  }
+
+  let workbookText: string;
+  let sheetCount: number;
+  try {
+    const parsed = await readWorkbook(item);
+    workbookText = parsed.text;
+    sheetCount = parsed.sheetCount;
+  } catch (err) {
+    console.error("[stress-test] xlsx parse failed:", err);
+    return jsonError(
+      "Could not parse the workbook. Save as .xlsx (Excel 2007+) and try again.",
+      400
+    );
+  }
+
+  if (!workbookText.trim()) {
+    return jsonError("The workbook appears to be empty.", 400);
+  }
+
+  const userPrompt = [
+    `## Source workbook`,
+    `File: ${item.name}`,
+    `Sheets: ${sheetCount}`,
+    ``,
+    `## Workbook contents (CSV per sheet, formulas preserved where readable)`,
+    workbookText,
+    ``,
+    `Stress test, audit, and write the markdown report following the exact section structure in your instructions.`,
+  ].join("\n");
+
+  const meta: StressTestResponse["meta"] = {
+    file_name: item.name,
+    sheet_count: sheetCount,
+    analyzed_at: new Date().toISOString(),
+  };
+
+  // === Stream Claude's output as Server-Sent Events ===
+  // Why streaming: on Vercel Hobby, total wall-clock is capped at 60s. Without
+  // streaming, a 70-second analysis returns nothing. With streaming, the user
+  // receives every text delta in real time and gets ~55s of report rendered
+  // before the function dies — far better than a hard timeout error.
+  //
+  // Protocol (one JSON object per `data:` line, default SSE event type):
+  //   data: { "type": "meta", "meta": { ... } }
+  //   data: { "type": "text", "chunk": "..." }
+  //   data: { "type": "done", "stop_reason": "end_turn" | "max_tokens" | ... }
+  //   data: { "type": "error", "message": "..." }
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (obj: unknown) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      };
+
+      try {
+        send({ type: "meta", meta });
+
+        const client = new Anthropic();
+        const apiStream = await client.messages.create({
+          model: MODEL,
+          // Same cap as before — streaming doesn't reduce token usage, it
+          // just delivers tokens as they arrive instead of in one buffered chunk.
+          max_tokens: 16000,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userPrompt }],
+          stream: true,
+        });
+
+        let stopReason: string | null = null;
+        for await (const event of apiStream) {
+          if (
+            event.type === "content_block_delta" &&
+            event.delta.type === "text_delta"
+          ) {
+            send({ type: "text", chunk: event.delta.text });
+          } else if (event.type === "message_delta") {
+            // Final stop_reason arrives on the message_delta event. Capture
+            // so the client can warn the user if Claude hit max_tokens.
+            stopReason = event.delta.stop_reason ?? stopReason;
+          }
+        }
+
+        if (stopReason === "max_tokens") {
+          console.warn(
+            "[stress-test] Claude hit max_tokens cap — report likely truncated."
+          );
+        }
+
+        send({ type: "done", stop_reason: stopReason });
+      } catch (err) {
+        console.error("[stress-test] stream failed:", err);
+        let message = "Stream failed.";
+        if (err instanceof Anthropic.AuthenticationError) {
+          message = "Invalid ANTHROPIC_API_KEY.";
+        } else if (err instanceof Anthropic.RateLimitError) {
+          message = "Rate limited by Anthropic. Try again in a moment.";
+        } else if (err instanceof Anthropic.APIError) {
+          message = `Anthropic API error (${err.status ?? "unknown"}): ${err.message}`;
+        } else if (err instanceof Error) {
+          message = err.message;
+        }
+        send({ type: "error", message });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      // Disable proxy/CDN buffering so chunks reach the browser immediately.
+      "X-Accel-Buffering": "no",
+    },
+  });
 }

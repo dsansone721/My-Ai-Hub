@@ -15,8 +15,25 @@ import type { StressTestResponse } from "@/app/api/stress-test/route";
 const FACG_NAVY = "#1B2B6B";
 const FACG_RED = "#C8102E";
 
+// Defensive cleanup if Claude wraps the document in stray ```fences
+// despite the system prompt instruction not to.
+function unwrapFences(text: string): string {
+  const trimmed = text.trim();
+  const fence = /^```(?:[a-zA-Z0-9_-]*)\s*\n([\s\S]*?)\n```$/;
+  const m = trimmed.match(fence);
+  return m ? m[1].trim() : trimmed;
+}
+
+type StreamMeta = StressTestResponse["meta"];
+
 export default function StressTestModelsPage() {
-  const [analyzing, setAnalyzing] = useState(false);
+  // `streaming` is true while chunks are still flowing in.
+  // `streamMd` accumulates raw markdown text deltas as they arrive.
+  // `report` is set once the stream completes — its presence drives the
+  // "Download PDF" button and the canonical (non-cursor) render.
+  const [streaming, setStreaming] = useState(false);
+  const [streamMd, setStreamMd] = useState("");
+  const [streamMeta, setStreamMeta] = useState<StreamMeta | null>(null);
   const [report, setReport] = useState<StressTestResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pdfLoading, setPdfLoading] = useState(false);
@@ -26,19 +43,118 @@ export default function StressTestModelsPage() {
   async function handleFile(file: File) {
     setError(null);
     setReport(null);
-    setAnalyzing(true);
+    setStreamMd("");
+    setStreamMeta(null);
+    setStreaming(true);
+
     try {
       const fd = new FormData();
       fd.append("file", file);
       const res = await fetch("/api/stress-test", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok)
-        throw new Error(data?.error ?? `Analysis failed (${res.status}).`);
-      setReport(data as StressTestResponse);
+
+      if (!res.ok) {
+        // Validation errors come back as plain JSON, not SSE
+        let msg = `Analysis failed (${res.status}).`;
+        try {
+          const data = await res.json();
+          if (data?.error) msg = data.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(msg);
+      }
+
+      if (!res.body) {
+        throw new Error("Response had no body — streaming not supported.");
+      }
+
+      // === SSE reader ===
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assembled = ""; // local accumulator (state updates are async)
+      let meta: StreamMeta | null = null;
+      let sawDone = false;
+      let streamError: string | null = null;
+
+      // Read until the stream closes. The server sends one `data: {...}\n\n`
+      // SSE event per chunk; we split on the blank-line delimiter.
+      readLoop: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Each complete event ends with "\n\n". Hold onto any incomplete
+        // tail in `buffer` for the next iteration.
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+
+        for (const raw of events) {
+          if (!raw.trim()) continue;
+          // Strip every "data: " prefix (an event can have multiple lines).
+          const payload = raw
+            .split("\n")
+            .filter((line) => line.startsWith("data: "))
+            .map((line) => line.slice(6))
+            .join("\n");
+          if (!payload) continue;
+
+          let evt: { type?: string } & Record<string, unknown>;
+          try {
+            evt = JSON.parse(payload);
+          } catch {
+            console.warn("[stress-test] dropped malformed SSE payload:", payload);
+            continue;
+          }
+
+          if (evt.type === "meta" && evt.meta && typeof evt.meta === "object") {
+            meta = evt.meta as StreamMeta;
+            setStreamMeta(meta);
+          } else if (evt.type === "text" && typeof evt.chunk === "string") {
+            assembled += evt.chunk;
+            setStreamMd(assembled);
+          } else if (evt.type === "done") {
+            sawDone = true;
+            break readLoop;
+          } else if (evt.type === "error" && typeof evt.message === "string") {
+            streamError = evt.message;
+            break readLoop;
+          }
+        }
+      }
+
+      // Drain anything still in the decoder.
+      buffer += decoder.decode();
+
+      if (streamError) throw new Error(streamError);
+
+      const finalMd = unwrapFences(assembled);
+
+      if (!finalMd.trim()) {
+        throw new Error("The model returned no text.");
+      }
+      if (!meta) {
+        // Server should always emit meta first; if not, fall back to a stub.
+        meta = {
+          file_name: file.name,
+          sheet_count: 0,
+          analyzed_at: new Date().toISOString(),
+        };
+      }
+
+      setReport({ report_markdown: finalMd, meta });
+
+      if (!sawDone) {
+        // Function was likely killed by the platform timeout before finishing.
+        // Show what we have and warn the user.
+        setError(
+          "The analysis was cut off before completing (likely a platform timeout). Showing partial results — re-upload to retry the full report."
+        );
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Analysis failed.");
     } finally {
-      setAnalyzing(false);
+      setStreaming(false);
       if (fileRef.current) fileRef.current.value = "";
     }
   }
@@ -131,7 +247,7 @@ export default function StressTestModelsPage() {
                 type="button"
                 onClick={() => fileRef.current?.click()}
                 className="font-medium text-accent underline-offset-2 hover:underline"
-                disabled={analyzing}
+                disabled={streaming}
               >
                 browse
               </button>{" "}
@@ -147,21 +263,74 @@ export default function StressTestModelsPage() {
                 if (file) handleFile(file);
               }}
               className="hidden"
-              disabled={analyzing}
+              disabled={streaming}
             />
           </div>
-          {analyzing && (
+          {streaming && (
             <div className="flex items-center gap-2 text-sm text-muted">
               <Loader2 className="h-4 w-4 animate-spin text-accent" />
-              Analyzing model — extracting assumptions, running scenarios,
-              drafting memo…
+              {streamMd
+                ? "Streaming report — sections will appear below as they're written…"
+                : "Analyzing model — extracting assumptions, running scenarios, drafting memo…"}
             </div>
           )}
           {error && <p className="text-sm text-red-400">{error}</p>}
         </CardBody>
       </Card>
 
-      {report && (
+      {/* Live, progressive view while chunks are arriving. The same panel
+          shape is used for the final `report` view below — when the stream
+          completes, the streaming card unmounts and the canonical card
+          (with Download button) takes its place. */}
+      {streaming && (streamMd || streamMeta) && (
+        <Card>
+          <div
+            className="flex items-center justify-between gap-3 rounded-t-xl px-5 py-3"
+            style={{ backgroundColor: FACG_NAVY }}
+          >
+            <div className="min-w-0">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/70">
+                Stress Test Report · Streaming
+              </p>
+              <p className="truncate text-sm font-semibold text-white">
+                {streamMeta?.file_name ?? "Model"}
+                {streamMeta?.sheet_count !== undefined && (
+                  <>
+                    {" · "}
+                    <span className="text-white/70">
+                      {streamMeta.sheet_count} sheets
+                    </span>
+                  </>
+                )}
+              </p>
+            </div>
+            <span className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-lg border border-white/20 bg-white/5 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-white">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+              </span>
+              Live
+            </span>
+          </div>
+          <CardBody>
+            {streamMd ? (
+              <>
+                <MarkdownReport text={streamMd} />
+                <div className="mt-2">
+                  <StreamCursor />
+                </div>
+              </>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-muted">
+                <Loader2 className="h-4 w-4 animate-spin text-accent" />
+                Waiting for first chunk from Claude…
+              </div>
+            )}
+          </CardBody>
+        </Card>
+      )}
+
+      {!streaming && report && (
         <Card>
           <div
             className="flex items-center justify-between gap-3 rounded-t-xl px-5 py-3"
@@ -330,6 +499,18 @@ function parseBlocks(md: string): Block[] {
 function splitRow(line: string): string[] {
   const inner = line.replace(/^\|/, "").replace(/\|$/, "");
   return inner.split("|").map((c) => c.trim());
+}
+
+// Pulsing block cursor shown at the tail of the live-streaming markdown
+// so the user sees visible progress between text chunks.
+function StreamCursor() {
+  return (
+    <span
+      aria-hidden="true"
+      className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse rounded-sm align-baseline"
+      style={{ backgroundColor: FACG_RED }}
+    />
+  );
 }
 
 function MarkdownReport({ text }: { text: string }) {

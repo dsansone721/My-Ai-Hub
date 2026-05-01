@@ -1451,75 +1451,105 @@ export async function POST(req: NextRequest) {
     const pdfkitModule = await import("pdfkit");
     const PDFDocument = (pdfkitModule.default ?? pdfkitModule) as PDFCtor;
 
-    const buffer = await new Promise<Buffer>((resolve, reject) => {
-      const p = new PB(PDFDocument);
-      const chunks: Buffer[] = [];
-      p.doc.on("data", (c: Buffer) => chunks.push(c));
-      p.doc.on("end", () => resolve(Buffer.concat(chunks)));
-      p.doc.on("error", reject);
-
-      // === Pages ===
-      renderCover(p, inputs, raise);
-      renderDisclaimers(p);
-
-      // We'll re-emit TOC at the end with real page numbers; for now leave a placeholder
-      // Simpler approach: build TOC entries first with hardcoded section start pages.
-      const toc: TocEntry[] = [
-        { num: "01", title: "Disclaimers & Confidentiality", page: 2 },
-        { num: "02", title: "Table of Contents", page: 3 },
-        { num: "03", title: "Executive Summary", page: 4 },
-        { num: "04", title: "The Opportunity", page: 6 },
-        { num: "05", title: "Project Description", page: 8 },
-        { num: "06", title: "Sponsor & Development Team", page: 10 },
-        { num: "07", title: "Market Analysis", page: 12 },
-        { num: "08", title: "Capital Structure & Sources & Uses", page: 14 },
-        { num: "09", title: "Financial Analysis", page: 16 },
-        { num: "10", title: "Investment Returns", page: 18 },
-        { num: "11", title: "Risk Factors & Mitigants", page: 20 },
-        { num: "12", title: "HUD Execution Strategy", page: 22 },
-        { num: "13", title: "Development Timeline", page: 24 },
-        { num: "14", title: "Capital Spent to Date", page: 26 },
-        { num: "15", title: "Appendix", page: 27 },
-        { num: "—", title: "Contact & Close", page: 29 },
-      ];
-      renderToc(p, toc);
-
-      renderExecSummary(p, inputs, narrative, body.underwriting ?? null, computed);
-      renderOpportunity(p, narrative);
-      renderProjectDescription(p, inputs, narrative, computed);
-      renderSponsorTeam(p, narrative);
-      renderMarket(p, narrative, body.comparables ?? null);
-      renderCapitalStructure(p, inputs, narrative, body.underwriting ?? null, computed);
-      renderFinancials(p, inputs, narrative, body.underwriting ?? null, computed);
-      renderReturns(p, narrative);
-      renderRisks(p, narrative, body.stressTest ?? null);
-      renderHudExecution(p, inputs, narrative);
-      renderTimeline(p, inputs, narrative);
-      renderCapitalSpent(p, inputs, narrative);
-      renderAppendix(p, inputs, computed, body.qa ?? []);
-      renderClose(p, inputs);
-
-      // Decorate (footer + watermark) on every page
-      p.decorateAllPages(true);
-
-      p.doc.end();
-    });
-
     const filename = `${(inputs.project_name || "Deal").replace(
       /[^a-zA-Z0-9_-]/g,
       "_"
     )}_FACG_Prospectus.pdf`;
 
-    // Cast to BodyInit at the response boundary. Node Buffer is always backed
-    // by ArrayBuffer at runtime, but @types/node now types it as
-    // Buffer<ArrayBufferLike>, which TypeScript refuses to widen to BodyInit's
-    // Uint8Array<ArrayBuffer> overload. The runtime value is correct.
-    return new NextResponse(buffer as unknown as BodyInit, {
+    // === Stream the PDF binary directly to the client ===
+    // We don't accumulate the full PDF in a Node Buffer anymore. As soon as
+    // pdfkit's underlying writable starts emitting chunks (during end()'s
+    // flushPages pass), they're enqueued onto the response stream and the
+    // browser's "Save As" dialog pops as soon as the first byte lands.
+    //
+    // Note: with bufferPages: true (which we need for cross-page footer
+    // numbering), pdfkit holds bytes until end() — so streaming here gives
+    // memory and first-byte-latency wins, NOT a Vercel-timeout fix.
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const p = new PB(PDFDocument);
+
+        p.doc.on("data", (chunk: Buffer) => {
+          // Convert Buffer view into a fresh Uint8Array<ArrayBuffer> the
+          // ReadableStream controller will accept. The .slice() copy is
+          // unavoidable: pdfkit reuses its internal buffer between writes.
+          controller.enqueue(
+            new Uint8Array(
+              chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength
+              ) as ArrayBuffer
+            )
+          );
+        });
+        p.doc.on("end", () => controller.close());
+        p.doc.on("error", (err: Error) => {
+          console.error("[generate-prospectus] pdfkit error:", err);
+          controller.error(err);
+        });
+
+        try {
+          // === Pages ===
+          renderCover(p, inputs, raise);
+          renderDisclaimers(p);
+
+          // We'll re-emit TOC at the end with real page numbers; for now leave a placeholder
+          // Simpler approach: build TOC entries first with hardcoded section start pages.
+          const toc: TocEntry[] = [
+            { num: "01", title: "Disclaimers & Confidentiality", page: 2 },
+            { num: "02", title: "Table of Contents", page: 3 },
+            { num: "03", title: "Executive Summary", page: 4 },
+            { num: "04", title: "The Opportunity", page: 6 },
+            { num: "05", title: "Project Description", page: 8 },
+            { num: "06", title: "Sponsor & Development Team", page: 10 },
+            { num: "07", title: "Market Analysis", page: 12 },
+            { num: "08", title: "Capital Structure & Sources & Uses", page: 14 },
+            { num: "09", title: "Financial Analysis", page: 16 },
+            { num: "10", title: "Investment Returns", page: 18 },
+            { num: "11", title: "Risk Factors & Mitigants", page: 20 },
+            { num: "12", title: "HUD Execution Strategy", page: 22 },
+            { num: "13", title: "Development Timeline", page: 24 },
+            { num: "14", title: "Capital Spent to Date", page: 26 },
+            { num: "15", title: "Appendix", page: 27 },
+            { num: "—", title: "Contact & Close", page: 29 },
+          ];
+          renderToc(p, toc);
+
+          renderExecSummary(p, inputs, narrative, body.underwriting ?? null, computed);
+          renderOpportunity(p, narrative);
+          renderProjectDescription(p, inputs, narrative, computed);
+          renderSponsorTeam(p, narrative);
+          renderMarket(p, narrative, body.comparables ?? null);
+          renderCapitalStructure(p, inputs, narrative, body.underwriting ?? null, computed);
+          renderFinancials(p, inputs, narrative, body.underwriting ?? null, computed);
+          renderReturns(p, narrative);
+          renderRisks(p, narrative, body.stressTest ?? null);
+          renderHudExecution(p, inputs, narrative);
+          renderTimeline(p, inputs, narrative);
+          renderCapitalSpent(p, inputs, narrative);
+          renderAppendix(p, inputs, computed, body.qa ?? []);
+          renderClose(p, inputs);
+
+          // Decorate (footer + watermark) on every page
+          p.decorateAllPages(true);
+
+          // Triggers the data → end event chain that drives the stream.
+          p.doc.end();
+        } catch (err) {
+          console.error("[generate-prospectus] render failed:", err);
+          controller.error(err);
+        }
+      },
+    });
+
+    return new Response(stream, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${filename}"`,
-        "Content-Length": String(buffer.byteLength),
+        // Content-Length is intentionally omitted — we don't know the final
+        // byte count up front when streaming. Browsers handle this fine and
+        // show progress as bytes arrive.
         "Cache-Control": "no-store",
       },
     });
