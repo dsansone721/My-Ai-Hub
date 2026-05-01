@@ -64,6 +64,27 @@ Model oversight:
 
 All percent values are the percent number (5.5 for 5.5%, NOT 0.055). All dollar values are absolute dollars without commas or symbols.
 
+=== HARD MAPPING RULES (read carefully — these are non-negotiable) ===
+
+The downstream wizard reads the keys above LITERALLY. Renaming a field, splitting it, or returning a synonym means the field will be ignored and the analyst will have to re-enter it. So:
+
+- "city_state" must be a single string in the form "City, ST" (e.g. "Tampa, FL"). If the source documents only give a full street address ("1234 Main St, Tampa, FL 33601"), STILL produce a separate "city_state" key in fields with just "Tampa, FL". Do not rely on the analyst to parse it from the address.
+- "project_name" — the property's marketed name (e.g. "Whitfield Apartments"). If only the borrower entity is named, use the borrower entity but flag with MEDIUM confidence.
+- "asset_type" — pick the closest match from the enum. For workforce / 80-120% AMI deals use "Workforce Multifamily". For purely market-rate deals use "Market Rate". For LIHTC / deeply-affordable use "Affordable". Default when ambiguous: "Workforce Multifamily".
+- "hud_program" — pick from the enum. New construction / sub-rehab → "221(d)(4)". Stabilized acquisition or refi → "223(f)". Senior housing → "231" or "232". Streamline refi → "223(a)(7)". Default when ambiguous: "221(d)(4)".
+- "total_units" — total number of residential units in the deal. If the source only gives the unit mix counts, sum them and return the sum here too.
+- Unit mix mapping — alias resolution:
+  - "Studio" / "Efficiency" → studio_count, studio_sf, studio_rent
+  - "1BR" / "1 Bedroom" / "One Bedroom" → one_br_count, one_br_sf, one_br_rent
+  - "2BR" / "2 Bedroom" / "Two Bedroom" → two_br_count, two_br_sf, two_br_rent
+  - "3BR" / "3 Bedroom" / "Three Bedroom" → three_br_count, three_br_sf, three_br_rent
+  Rent values are MONTHLY (not annual). If the source quotes annual rent, divide by 12.
+- "hud_loan_amount" — the size of the HUD-insured permanent loan in dollars. Aliases: "loan amount", "permanent loan", "HUD request", "loan request". Just the number.
+- "land_value" — appraised or contract land basis. Aliases: "land cost", "land basis", "site cost", "land acquisition".
+- "hard_costs" — total hard construction cost. Aliases: "construction costs", "hard construction", "GMP", "construction contract".
+
+Every field above that you can extract MUST be in the "fields" object — those are the keys the wizard reads to populate Step 2 onward. The "found" array in the report is for human display; the "fields" object is the structured payload.
+
 === SOURCES & USES (HIGHEST PRIORITY) ===
 
 If anything in the upload contains a Sources & Uses table (typical Excel "Sources & Uses" / "S&U" / "Capital Structure" sheet, or OM/term-sheet pages), extract it EXACTLY AS SHOWN.

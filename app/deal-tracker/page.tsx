@@ -255,6 +255,7 @@ export default function DealTrackerPage() {
       {step === 2 && (
         <Step2Comparables
           state={state}
+          setInputs={setInputs}
           setComparables={(c) =>
             setState((s) => ({ ...s, comparables: c }))
           }
@@ -1007,6 +1008,40 @@ function coerceForInputsKey<K extends keyof DealInputs>(
   return undefined;
 }
 
+// Try to pull "City, ST" out of a free-form address. Handles common shapes:
+//   "1234 Main St, Tampa, FL 33601"   → "Tampa, FL"
+//   "1234 Main St, Tampa, FL"         → "Tampa, FL"
+//   "Tampa, FL 33601"                 → "Tampa, FL"
+//   "Tampa, FL"                       → "Tampa, FL"
+// Returns "" when no two-letter state is found — we never invent one.
+function deriveCityStateFromAddress(address: string): string {
+  if (!address) return "";
+  const trimmed = address.trim();
+  // Match "<city words>, <ST>[ <zip>]" allowing 2-letter uppercase state.
+  const m = trimmed.match(
+    /([A-Za-z][A-Za-z\s.'-]{1,40}),\s*([A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$/
+  );
+  if (!m) return "";
+  const city = m[1].trim().replace(/\s{2,}/g, " ");
+  const state = m[2];
+  return `${city}, ${state}`;
+}
+
+const ASSET_TYPE_VALUES = new Set<string>([
+  "Workforce Multifamily",
+  "Market Rate",
+  "Affordable",
+  "Senior Housing",
+  "Student Housing",
+]);
+const HUD_PROGRAM_VALUES = new Set<string>([
+  "221(d)(4)",
+  "223(f)",
+  "231",
+  "232",
+  "223(a)(7)",
+]);
+
 function applyFieldsToInputs(
   current: DealInputs,
   fields: Record<string, unknown>,
@@ -1016,11 +1051,59 @@ function applyFieldsToInputs(
   for (const [k, v] of Object.entries(fields)) {
     if (v === undefined || v === null) continue;
     if (!(k in DEFAULT_INPUTS)) continue;
+
+    // Drop invalid enum values rather than coercing them — Step 2/3 read
+    // these as typed enums and a stray string would render as a broken
+    // <select>. Better to leave the existing default in place.
+    if (k === "asset_type" && typeof v === "string" && !ASSET_TYPE_VALUES.has(v)) {
+      continue;
+    }
+    if (k === "hud_program" && typeof v === "string" && !HUD_PROGRAM_VALUES.has(v)) {
+      continue;
+    }
+
     const coerced = coerceForInputsKey(k as keyof DealInputs, v);
     if (coerced === undefined) continue;
     next[k] = coerced;
     acceptedKeysOut.push(k);
   }
+
+  // === Derivations: fill canonical keys when Claude returned a related but
+  // non-canonical signal. Always run AFTER the main loop so explicit fields
+  // win over derived ones. ===
+  //
+  // 1. city_state — if it's still blank but we have an address, parse it.
+  //    Step 2 won't fire its comps API without a market location, so this
+  //    rescue path cuts down on "missing city_state" gap questions.
+  if (
+    typeof next.city_state === "string" &&
+    !next.city_state.trim() &&
+    typeof next.address === "string"
+  ) {
+    const derived = deriveCityStateFromAddress(next.address);
+    if (derived) {
+      next.city_state = derived;
+      acceptedKeysOut.push("city_state");
+    }
+  }
+
+  // 2. total_units — if missing/zero but the unit-mix counts add up to a
+  //    positive number, mirror the sum into total_units so anything that
+  //    reads it directly (display, downstream prompts) has a value. The
+  //    deterministic compute path already falls back to the mix-sum, but
+  //    not every consumer does.
+  if (typeof next.total_units === "number" && next.total_units <= 0) {
+    const sum =
+      (Number(next.studio_count) || 0) +
+      (Number(next.one_br_count) || 0) +
+      (Number(next.two_br_count) || 0) +
+      (Number(next.three_br_count) || 0);
+    if (sum > 0) {
+      next.total_units = sum;
+      acceptedKeysOut.push("total_units");
+    }
+  }
+
   return next as DealInputs;
 }
 
@@ -1037,11 +1120,13 @@ function applyOneRawValue(
 // === Step 2: Comparables ===
 function Step2Comparables({
   state,
+  setInputs,
   setComparables,
   onBack,
   onNext,
 }: {
   state: WizardState;
+  setInputs: (next: DealInputs) => void;
   setComparables: (c: WizardComparables | null) => void;
   onBack: () => void;
   onNext: () => void;
@@ -1050,7 +1135,27 @@ function Step2Comparables({
   const [error, setError] = useState<string | null>(null);
   const fired = useRef(false);
 
+  // city_state may be empty if the intake agent couldn't extract it AND
+  // couldn't derive it from address. Rather than hard-blocking the wizard,
+  // we render an inline confirm form, take the analyst's input, write it
+  // to state.inputs, and THEN fire the comps API. This keeps progression
+  // unblocked even when intake came up short.
+  const initialLocation = state.inputs.city_state.trim();
+  const [locationDraft, setLocationDraft] = useState(initialLocation);
+  const [confirmedLocation, setConfirmedLocation] = useState(initialLocation);
+  const needsLocation = !confirmedLocation;
+
+  function handleConfirmLocation() {
+    const v = locationDraft.trim();
+    if (!v) return;
+    // Persist to wizard state so downstream steps + the comps API see it.
+    setInputs({ ...state.inputs, city_state: v });
+    setConfirmedLocation(v);
+    fired.current = false; // allow the effect below to fire on next render
+  }
+
   useEffect(() => {
+    if (needsLocation) return;
     if (state.comparables || fired.current) return;
     fired.current = true;
     (async () => {
@@ -1072,7 +1177,59 @@ function Step2Comparables({
         setLoading(false);
       }
     })();
-  }, [state.comparables, state.inputs, setComparables]);
+  }, [needsLocation, state.comparables, state.inputs, setComparables]);
+
+  if (needsLocation) {
+    return (
+      <div className="space-y-6">
+        <FacgPanel icon={Building2} title="Confirm Market Location">
+          <p className="mb-3 text-sm text-white/85">
+            The intake agent couldn&apos;t pin down the deal&apos;s market.
+            Confirm the city &amp; state below before we pull comps.
+          </p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <FieldShell label="City, State">
+              <input
+                type="text"
+                value={locationDraft}
+                onChange={(e) => setLocationDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleConfirmLocation();
+                }}
+                placeholder="e.g. Tampa, FL"
+                autoFocus
+                className={inputClass}
+              />
+            </FieldShell>
+            <FacgButton
+              onClick={handleConfirmLocation}
+              disabled={!locationDraft.trim()}
+            >
+              Confirm &amp; Pull Comps <ArrowRight className="h-4 w-4" />
+            </FacgButton>
+          </div>
+          <p className="mt-3 text-[11px] text-muted">
+            We expect the form &quot;City, ST&quot; — for example,{" "}
+            <span className="text-white/80">&quot;Sarasota, FL&quot;</span> or{" "}
+            <span className="text-white/80">&quot;Phoenix, AZ&quot;</span>.
+          </p>
+        </FacgPanel>
+
+        <NavRow>
+          <button
+            type="button"
+            onClick={onBack}
+            className="inline-flex items-center gap-1 rounded-lg border border-border bg-elevated px-3 py-2 text-xs text-white hover:border-accent/60"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" /> Back to Intake
+          </button>
+          <span className="text-xs text-muted">
+            Comps run after the location is confirmed.
+          </span>
+        </NavRow>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
