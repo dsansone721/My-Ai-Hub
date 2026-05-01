@@ -17,10 +17,51 @@ const WHITE = "FFFFFF";
 const LIGHT = "F2F4F8";
 const TEXT_DARK = "1A1A1A";
 
+const PITCH_AUDIENCES = [
+  "internal",
+  "senior_debt",
+  "mezzanine",
+  "preferred_equity",
+  "common_equity",
+] as const;
+type PitchAudience = (typeof PITCH_AUDIENCES)[number];
+
+const PITCH_AUDIENCE_META: Record<
+  PitchAudience,
+  { filenameSlug: string; coverTag: string }
+> = {
+  internal: {
+    filenameSlug: "Internal_Review",
+    coverTag: "Internal FACG Review",
+  },
+  senior_debt: {
+    filenameSlug: "Senior_Debt",
+    coverTag: "Senior Debt Lender",
+  },
+  mezzanine: {
+    filenameSlug: "Mezzanine",
+    coverTag: "Mezzanine Lender",
+  },
+  preferred_equity: {
+    filenameSlug: "Preferred_Equity",
+    coverTag: "Preferred Equity Investor",
+  },
+  common_equity: {
+    filenameSlug: "Common_Equity",
+    coverTag: "Common Equity / JV Partner",
+  },
+};
+
+function isPitchAudience(v: unknown): v is PitchAudience {
+  return typeof v === "string" && (PITCH_AUDIENCES as readonly string[]).includes(v);
+}
+
 type Body = {
   inputs?: DealInputs;
   underwriting?: UnderwritingResult | null;
   comparables?: WizardComparables | null;
+  /** Audience the deck is being prepared for. Defaults to "internal". */
+  audience?: PitchAudience;
 };
 
 function jsonError(message: string, status: number) {
@@ -51,6 +92,12 @@ export async function POST(req: NextRequest) {
     const inputs = body.inputs;
     if (!inputs) return jsonError("Missing 'inputs'.", 400);
 
+    // Default to internal review if omitted (legacy single-button behaviour).
+    const audience: PitchAudience = isPitchAudience(body.audience)
+      ? body.audience
+      : "internal";
+    const audienceMeta = PITCH_AUDIENCE_META[audience];
+
     const computed = body.underwriting?.computed ?? computeMetrics(inputs);
 
     const PptxGenJsModule = await import("pptxgenjs");
@@ -76,6 +123,19 @@ export async function POST(req: NextRequest) {
         w: 13.33,
         h: 0.15,
         fill: { color: RED },
+      });
+
+      // Audience tag — small uppercase chip top-left so the reader sees
+      // immediately who the deck is for.
+      slide.addText(`PREPARED FOR · ${audienceMeta.coverTag.toUpperCase()}`, {
+        x: 0.6,
+        y: 0.5,
+        w: 12,
+        h: 0.4,
+        fontSize: 11,
+        color: WHITE,
+        bold: true,
+        charSpacing: 3,
       });
 
       // Property name (large)
@@ -616,10 +676,11 @@ export async function POST(req: NextRequest) {
     }
 
     const buf = (await pres.write({ outputType: "nodebuffer" })) as Buffer;
-    const filename = `${(inputs.project_name || "Deal").replace(
+    const safeProject = (inputs.project_name || "Deal").replace(
       /[^a-zA-Z0-9_-]/g,
       "_"
-    )}_FACG_Pitch_Deck.pptx`;
+    );
+    const filename = `${safeProject}_FACG_${audienceMeta.filenameSlug}_Pitch_Deck.pptx`;
 
     // Cast to BodyInit at the response boundary. Node Buffer is always backed
     // by ArrayBuffer at runtime, but @types/node now types it as

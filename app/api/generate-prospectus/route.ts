@@ -229,12 +229,103 @@ function jsonError(message: string, status: number) {
 
 // === Body type ===
 
+const PROSPECTUS_TYPES = [
+  "senior_debt",
+  "mezzanine",
+  "preferred_equity",
+  "common_equity",
+] as const;
+type ProspectusType = (typeof PROSPECTUS_TYPES)[number];
+
+const PROSPECTUS_TYPE_LABELS: Record<
+  ProspectusType,
+  { filenameSlug: string; coverLabel: string; titleSuffix: string }
+> = {
+  senior_debt: {
+    filenameSlug: "Senior_Debt",
+    coverLabel: "Senior Debt Prospectus",
+    titleSuffix: "for Senior Secured Lenders",
+  },
+  mezzanine: {
+    filenameSlug: "Mezzanine",
+    coverLabel: "Mezzanine Prospectus",
+    titleSuffix: "for Mezzanine Lenders",
+  },
+  preferred_equity: {
+    filenameSlug: "Preferred_Equity",
+    coverLabel: "Preferred Equity Prospectus",
+    titleSuffix: "for Preferred Equity Investors",
+  },
+  common_equity: {
+    filenameSlug: "Common_Equity",
+    coverLabel: "Common Equity / JV Prospectus",
+    titleSuffix: "for Common Equity / JV Partners",
+  },
+};
+
+// Audience-specific addenda appended to SYSTEM_PROMPT. Each one tells Claude
+// who the reader is, what to lead with, and what to emphasize. The base
+// SYSTEM_PROMPT still defines the JSON output shape (every section); the
+// addenda only shift WHAT goes into each section, not the overall structure.
+const PROSPECTUS_ADDENDA: Record<ProspectusType, string> = {
+  senior_debt: `=== AUDIENCE: SENIOR DEBT LENDER ===
+
+You are writing a prospectus for a senior secured lender. Emphasize: loan-to-cost, loan-to-value, debt service coverage ratio, collateral quality, sponsor equity contribution, exit strategy and loan repayment, HUD insurance (if applicable), and downside protection. Lead with credit metrics. Risk section should address collateral coverage in a distressed scenario.
+
+Specifically:
+- The investment_highlights array MUST lead with the LTC, LTV, and DSCR — quote the numbers.
+- The capital_structure_narrative must spell out the senior position, the equity cushion below it, and the path to repayment at HUD permanent close (or sale).
+- The returns_analysis is irrelevant here; replace it with a paragraph in waterfall describing senior debt yield, prepayment economics, and HUD insurance protection.
+- The risk_factors must include at least one explicit "collateral coverage in a distressed scenario" item showing the cushion to par.
+- Use the language of a credit memo — "the Loan", "the Borrower", "the Collateral" — not the language of an equity pitch.`,
+
+  mezzanine: `=== AUDIENCE: MEZZANINE LENDER ===
+
+You are writing a prospectus for a mezzanine lender taking a subordinate debt position. Emphasize: total debt stack, mezz position and security, preferred return and PIK structure, intercreditor dynamics, IRR to mezz position, prepayment and exit mechanics, and coverage after senior debt service. Include a waterfall showing mezz recovery in base, stress, and liquidation scenarios.
+
+Specifically:
+- The capital_structure_narrative must lay out the full debt stack (senior, mezz, equity) with dollar amounts and percentages, and describe the intercreditor relationship.
+- The returns_analysis.waterfall must explicitly show mezz recovery in (a) base case full repayment, (b) stress case with senior coverage tight, and (c) liquidation. Use real numbers from the underwriting + stress data where available.
+- The investment_highlights MUST lead with the mezz position size, the coupon + PIK, and the residual coverage above the mezz strike after senior debt service.
+- The risk_factors must include intercreditor / standstill risk, prepayment lockout / make-whole risk, and what happens to mezz recovery if NOI declines 10-15%.
+- Voice is the credit-memo voice, not the equity-pitch voice.`,
+
+  preferred_equity: `=== AUDIENCE: PREFERRED EQUITY INVESTOR ===
+
+You are writing a prospectus for a preferred equity investor. Emphasize: preferred return rate, cumulative vs non-cumulative structure, preferred equity position in the capital stack, common equity cushion below preferred, cash-on-cash preferred return, redemption timeline, and downside scenarios showing preferred equity recovery. Include a distribution waterfall. Lead with the preferred return and how it gets paid.
+
+Specifically:
+- The investment_highlights MUST lead with the preferred return rate (%), whether it's cumulative, and the redemption timeline.
+- The capital_structure_narrative must describe the pref's position in the stack, the equity cushion below it, and the priority of distributions.
+- The returns_analysis must contain (a) base_case showing how preferred return is satisfied year-by-year, (b) downside_case showing recovery if cash flow is constrained, (c) waterfall as the formal distribution priority — current pref, accrued/PIK if applicable, return of capital, then common.
+- The risk_factors must include cash-flow-availability risk for the pref, structural subordination to senior debt, and PIK accrual/dilution if base case slips.
+- Tone is "credit-flavored equity" — disciplined, focused on the stated coupon and recovery, not on IRR upside.`,
+
+  common_equity: `=== AUDIENCE: COMMON EQUITY / JV PARTNER ===
+
+You are writing a prospectus for a common equity investor or JV partner. Emphasize: total project IRR, equity multiple, cash-on-cash returns, value creation thesis, upside scenarios, co-GP structure and promote, exit strategy and timing. Lead with the return story. Include upside, base, and downside cases with full equity waterfall.
+
+Specifically:
+- The investment_highlights MUST lead with the projected IRR, equity multiple (MOIC), and the value creation thesis (e.g., development cost basis vs stabilized exit value).
+- The exit_strategy must specifically address the disposition strategy (refi-and-hold vs sale at stabilization) and the JV's role in that decision.
+- The returns_analysis must contain real upside_case, base_case, and downside_case paragraphs with IRR and equity multiple referenced. The waterfall paragraph must describe the full equity waterfall — pari passu, preferred return, return of capital, promote tiers / hurdles, and the catch-up if applicable.
+- The capital_structure_narrative must explicitly call out the common equity check size, sponsor co-invest, and any promote / GP economics.
+- The risk_factors must include market risk, exit-timing risk, and dilution/dilutive-event risk to common equity.
+- Tone is the equity-pitch voice — confident on thesis, transparent on downside, never marketing-speak.`,
+};
+
+function isProspectusType(v: unknown): v is ProspectusType {
+  return typeof v === "string" && (PROSPECTUS_TYPES as readonly string[]).includes(v);
+}
+
 type Body = {
   inputs?: DealInputs;
   underwriting?: UnderwritingResult | null;
   comparables?: WizardComparables | null;
   stressTest?: StressTestResult | null;
   qa?: QAItem[];
+  /** Audience for the prospectus. Defaults to "senior_debt" when omitted. */
+  prospectus_type?: ProspectusType;
 };
 
 // === PDF Builder ===
@@ -605,7 +696,12 @@ class PB {
 
 // === Page renderers ===
 
-function renderCover(p: PB, inputs: DealInputs, raise: number) {
+function renderCover(
+  p: PB,
+  inputs: DealInputs,
+  raise: number,
+  audienceLabel: string
+) {
   p.doc.addPage();
   // Full navy background
   p.doc.rect(0, 0, p.pageW, p.pageH).fill(NAVY);
@@ -623,10 +719,11 @@ function renderCover(p: PB, inputs: DealInputs, raise: number) {
       lineBreak: false,
     });
 
-  // Title block
+  // Title block — the prospectus type drives the COVER LABEL so the four
+  // audience-specific PDFs are immediately distinguishable side-by-side.
   const titleY = 240;
   p.doc.font("Helvetica").fontSize(11).fillColor(WHITE).opacity(0.7);
-  p.doc.text("CONFIDENTIAL INVESTOR PROSPECTUS", p.marginX, titleY, {
+  p.doc.text(`CONFIDENTIAL · ${audienceLabel.toUpperCase()}`, p.marginX, titleY, {
     characterSpacing: 3,
   });
   p.doc.opacity(1);
@@ -1384,6 +1481,14 @@ export async function POST(req: NextRequest) {
     const inputs = body.inputs;
     if (!inputs) return jsonError("Missing 'inputs'.", 400);
 
+    // Default to senior_debt when omitted — that's the legacy single-button
+    // behavior, and senior debt is the most common first-touch audience.
+    const prospectusType: ProspectusType = isProspectusType(body.prospectus_type)
+      ? body.prospectus_type
+      : "senior_debt";
+    const typeLabels = PROSPECTUS_TYPE_LABELS[prospectusType];
+    const fullSystemPrompt = `${SYSTEM_PROMPT}\n\n${PROSPECTUS_ADDENDA[prospectusType]}`;
+
     const computed = body.underwriting?.computed ?? computeMetrics(inputs);
     // Total capital raise = authoritative S&U sources total (extracted or
     // derived in the underwriting route). No reassembly here — the
@@ -1398,6 +1503,9 @@ export async function POST(req: NextRequest) {
       try {
         const client = new Anthropic();
         const userPrompt = [
+          `## Audience`,
+          typeLabels.coverLabel,
+          ``,
           `## Deal Inputs`,
           JSON.stringify(inputs, null, 2),
           ``,
@@ -1413,12 +1521,12 @@ export async function POST(req: NextRequest) {
           `## Sponsor Q&A`,
           JSON.stringify(body.qa ?? [], null, 2),
           ``,
-          `Generate the prospectus narrative JSON.`,
+          `Generate the prospectus narrative JSON for the ${typeLabels.coverLabel.toLowerCase()} audience.`,
         ].join("\n");
         const response = await client.messages.create({
           model: MODEL,
           max_tokens: 8192,
-          system: SYSTEM_PROMPT,
+          system: fullSystemPrompt,
           messages: [{ role: "user", content: userPrompt }],
         });
         const rawText = response.content
@@ -1451,10 +1559,11 @@ export async function POST(req: NextRequest) {
     const pdfkitModule = await import("pdfkit");
     const PDFDocument = (pdfkitModule.default ?? pdfkitModule) as PDFCtor;
 
-    const filename = `${(inputs.project_name || "Deal").replace(
+    const safeProject = (inputs.project_name || "Deal").replace(
       /[^a-zA-Z0-9_-]/g,
       "_"
-    )}_FACG_Prospectus.pdf`;
+    );
+    const filename = `${safeProject}_FACG_${typeLabels.filenameSlug}_Prospectus.pdf`;
 
     // === Stream the PDF binary directly to the client ===
     // We don't accumulate the full PDF in a Node Buffer anymore. As soon as
@@ -1490,7 +1599,7 @@ export async function POST(req: NextRequest) {
 
         try {
           // === Pages ===
-          renderCover(p, inputs, raise);
+          renderCover(p, inputs, raise, typeLabels.coverLabel);
           renderDisclaimers(p);
 
           // We'll re-emit TOC at the end with real page numbers; for now leave a placeholder

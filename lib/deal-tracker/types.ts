@@ -779,12 +779,84 @@ export type ExtractedSourcesUses = {
   source_location: string;
 };
 
+// === AI intake agent ===
+//
+// Step 1 of the wizard is now an analyst-style intake: the user uploads
+// arbitrary documents + paste-in text, Claude reads everything, and produces
+// a structured triage report (what was found, what conflicts, what's still
+// missing). The wizard advances when the analyst confirms the conflicts and
+// answers the gap questions.
+
+export type IntakeConfidence = "HIGH" | "MEDIUM" | "LOW";
+
+export type IntakeField = {
+  /** Human-readable label, e.g. "Total Units" or "HUD Loan Amount". */
+  label: string;
+  /** Raw value as it should be displayed (formatted with units). */
+  value: string;
+  /** Where the value came from — "OM page 4", "MD email", "Excel: Project Summary". */
+  source: string;
+  confidence: IntakeConfidence;
+  /** When this maps to a structured DealInputs key, name it. */
+  inputs_key?: keyof DealInputs;
+};
+
+export type IntakeConflictOption = {
+  value: string;
+  source: string;
+};
+
+export type IntakeConflict = {
+  /** Stable id like "c1" so the answer can be persisted by id. */
+  id: string;
+  label: string;
+  /** Two or more candidate values pulled from different sources. */
+  options: IntakeConflictOption[];
+  /** Optional analyst-style hint for which option is more authoritative. */
+  recommendation?: string;
+  /** When known, the DealInputs field this conflict resolves. */
+  inputs_key?: keyof DealInputs;
+};
+
+export type IntakeQuestion = {
+  /** Stable id like "q1" so the answer can be persisted by id. */
+  id: string;
+  question: string;
+  /** 1-line "why this matters" — surfaced as a sub-line in the UI. */
+  why?: string;
+  /** Required questions must be answered before the wizard advances. */
+  required: boolean;
+  /** When the answer should populate a DealInputs key, name it. */
+  inputs_key?: keyof DealInputs;
+};
+
+export type IntakeReport = {
+  /** 1-2 sentence top-level synopsis. */
+  summary: string;
+  found: IntakeField[];
+  conflicts: IntakeConflict[];
+  questions: IntakeQuestion[];
+  /** Files actually processed (server-side). */
+  files_processed: string[];
+};
+
+/**
+ * Map of intake item id → analyst's answer.
+ * - For conflicts: the answer is the chosen value (one of `options[].value`).
+ * - For questions: the answer is the free-form text the analyst typed.
+ */
+export type IntakeAnswers = Record<string, string>;
+
 export type WizardState = {
   inputs: DealInputs;
   /** Field keys populated by the file-extraction route (provenance tracking). */
   extractedFields: string[];
   /** Authoritative S&U pulled verbatim from an uploaded model, when present. */
   extractedSourcesUses: ExtractedSourcesUses | null;
+  /** Triage report from the AI intake agent (Step 1). Null until analyzed. */
+  intakeReport: IntakeReport | null;
+  /** Analyst's answers to conflicts and gap questions. Keyed by item id. */
+  intakeAnswers: IntakeAnswers;
   comparables: WizardComparables | null;
   underwriting: UnderwritingResult | null;
   stressTest: StressTestResult | null;
@@ -795,6 +867,8 @@ export const EMPTY_WIZARD_STATE: WizardState = {
   inputs: { ...DEFAULT_INPUTS },
   extractedFields: [],
   extractedSourcesUses: null,
+  intakeReport: null,
+  intakeAnswers: {},
   comparables: null,
   underwriting: null,
   stressTest: null,

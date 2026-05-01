@@ -9,15 +9,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   Info,
-  ChevronDown,
-  ChevronRight,
   ArrowRight,
   ArrowLeft,
   ClipboardList,
   Layers,
   DollarSign as DollarIcon,
-  Settings2,
-  Users as UsersIcon,
   Building2,
   Calculator,
   ShieldAlert,
@@ -28,16 +24,18 @@ import {
   X,
   ChartArea,
   Trash2,
+  Mail,
+  MessageSquare,
+  HelpCircle,
+  FileText,
+  Image as ImageIcon,
+  Brain,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { Card, CardBody } from "@/components/Card";
 import {
-  ASSET_TYPES,
-  HUD_PROGRAMS,
+  DEFAULT_INPUTS,
   EMPTY_WIZARD_STATE,
-  computeMetrics,
-  type AssetType,
-  type HudProgram,
   type DealInputs,
   type WizardState,
   type WizardComparables,
@@ -45,6 +43,8 @@ import {
   type StressTestResult,
   type QAItem,
   type ExtractedSourcesUses,
+  type IntakeReport,
+  type IntakeAnswers,
 } from "@/lib/deal-tracker/types";
 
 const FACG_NAVY = "#1B2B6B";
@@ -181,9 +181,6 @@ export default function DealTrackerPage() {
     savePersisted(step, state);
   }, [step, state, hydrated]);
 
-  function patchInputs(p: Partial<DealInputs>) {
-    setState((s) => ({ ...s, inputs: { ...s.inputs, ...p } }));
-  }
   function setInputs(next: DealInputs) {
     setState((s) => ({ ...s, inputs: next }));
   }
@@ -197,6 +194,12 @@ export default function DealTrackerPage() {
   function setExtractedSourcesUses(esu: ExtractedSourcesUses | null) {
     // Last-write-wins: a new upload with an S&U table replaces the prior one.
     setState((s) => ({ ...s, extractedSourcesUses: esu }));
+  }
+  function setIntakeReport(r: IntakeReport | null) {
+    setState((s) => ({ ...s, intakeReport: r }));
+  }
+  function setIntakeAnswers(a: IntakeAnswers) {
+    setState((s) => ({ ...s, intakeAnswers: a }));
   }
   function handleClearDeal() {
     if (
@@ -241,10 +244,11 @@ export default function DealTrackerPage() {
       {step === 1 && (
         <Step1Intake
           state={state}
-          patchInputs={patchInputs}
           setInputs={setInputs}
           onExtractedFields={setExtractedFields}
           onExtractedSourcesUses={setExtractedSourcesUses}
+          onIntakeReport={setIntakeReport}
+          onIntakeAnswers={setIntakeAnswers}
           onNext={() => setStep(2)}
         />
       )}
@@ -375,139 +379,302 @@ function ProgressBar({
   );
 }
 
-// === Step 1: Intake ===
+// === Step 1: AI Intake Agent ===
+//
+// Step 1 is now a single-pass intake: the analyst dumps everything they have
+// (files of any kind, the MD's email, a free-text description) and Claude
+// writes a triage report — what was found, what conflicts across documents,
+// and exactly what's missing. The wizard advances when every conflict has
+// been confirmed and every required gap question answered.
+
 function Step1Intake({
   state,
-  patchInputs,
   setInputs,
   onExtractedFields,
   onExtractedSourcesUses,
+  onIntakeReport,
+  onIntakeAnswers,
   onNext,
 }: {
   state: WizardState;
-  patchInputs: (p: Partial<DealInputs>) => void;
   setInputs: (next: DealInputs) => void;
   onExtractedFields: (keys: string[]) => void;
   onExtractedSourcesUses: (esu: ExtractedSourcesUses | null) => void;
+  onIntakeReport: (r: IntakeReport | null) => void;
+  onIntakeAnswers: (a: IntakeAnswers) => void;
   onNext: () => void;
 }) {
-  const inputs = state.inputs;
-  const computed = useMemo(() => computeMetrics(inputs), [inputs]);
-  const [extracting, setExtracting] = useState(false);
-  const [extractNotes, setExtractNotes] = useState<string | null>(null);
-  const [extractError, setExtractError] = useState<string | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  // Local state for the input zones — files don't survive navigation.
+  const [files, setFiles] = useState<File[]>([]);
+  const [email, setEmail] = useState("");
+  const [blurb, setBlurb] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [analyzeNotes, setAnalyzeNotes] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
-  function update<K extends keyof DealInputs>(key: K, value: DealInputs[K]) {
-    patchInputs({ [key]: value } as Partial<DealInputs>);
+  const report = state.intakeReport;
+  const answers = state.intakeAnswers;
+
+  function patchAnswer(id: string, value: string) {
+    onIntakeAnswers({ ...answers, [id]: value });
   }
 
-  async function handleFiles(files: FileList | File[]) {
-    const arr = Array.from(files).filter((f) => f.size > 0);
+  function addFiles(list: FileList | File[]) {
+    const arr = Array.from(list).filter((f) => f.size > 0);
     if (arr.length === 0) return;
-    setExtractError(null);
-    setExtractNotes(null);
-    setExtracting(true);
+    setFiles((prev) => [...prev, ...arr]);
+  }
+  function removeFile(idx: number) {
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  async function handleAnalyze() {
+    if (files.length === 0 && !email.trim() && !blurb.trim()) {
+      setAnalyzeError("Add at least one file, an email, or a deal description.");
+      return;
+    }
+    setAnalyzeError(null);
+    setAnalyzeNotes(null);
+    setAnalyzing(true);
     try {
       const fd = new FormData();
-      for (const f of arr) fd.append("file", f);
-      const res = await fetch("/api/deal-tracker/extract", {
+      for (const f of files) fd.append("file", f);
+      if (email.trim()) fd.append("email", email.trim());
+      if (blurb.trim()) fd.append("blurb", blurb.trim());
+
+      const res = await fetch("/api/deal-tracker/intake", {
         method: "POST",
         body: fd,
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? `Upload failed (${res.status})`);
-      const fields = (data.fields ?? {}) as Partial<DealInputs>;
-      const next = { ...inputs };
+      if (!res.ok)
+        throw new Error(data?.error ?? `Analysis failed (${res.status}).`);
+
+      // Apply extracted fields directly into wizard inputs so downstream
+      // steps (Step 3 deterministic compute, etc.) have the data they need.
+      const extractedFields = (data.fields ?? {}) as Record<string, unknown>;
       const acceptedKeys: string[] = [];
-      for (const [k, v] of Object.entries(fields)) {
-        if (v === undefined || v === null) continue;
-        if (k in inputs) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (next as any)[k] = v;
-          acceptedKeys.push(k);
-        }
-      }
+      const next = applyFieldsToInputs(state.inputs, extractedFields, acceptedKeys);
       setInputs(next);
       if (acceptedKeys.length > 0) onExtractedFields(acceptedKeys);
-      // Capture verbatim S&U if the extractor returned one — this becomes the
-      // single source of truth for the deal's capital structure and flows
-      // through underwriting and all document generators untouched.
+
+      // Verbatim S&U flows untouched through to underwriting + generators.
       if (data.sources_uses !== undefined) {
         onExtractedSourcesUses(
           (data.sources_uses as ExtractedSourcesUses | null) ?? null
         );
       }
-      if (typeof data.notes === "string" && data.notes) setExtractNotes(data.notes);
+
+      // Persist the intake triage report and reset answers (new ids).
+      onIntakeReport((data.report as IntakeReport | null) ?? null);
+      onIntakeAnswers({});
+
+      if (typeof data.notes === "string" && data.notes) setAnalyzeNotes(data.notes);
     } catch (err) {
-      setExtractError(err instanceof Error ? err.message : "Extraction failed.");
+      setAnalyzeError(err instanceof Error ? err.message : "Analysis failed.");
     } finally {
-      setExtracting(false);
+      setAnalyzing(false);
       if (fileRef.current) fileRef.current.value = "";
     }
   }
 
-  const canProceed = inputs.project_name.trim().length > 0 && inputs.city_state.trim().length > 0;
+  // === Gating logic: build button enables only when every conflict is
+  // resolved and every required question has a non-empty answer. ===
+  const requiredQs = report?.questions.filter((q) => q.required) ?? [];
+  const conflicts = report?.conflicts ?? [];
+  const allRequiredAnswered =
+    !!report &&
+    requiredQs.every((q) => (answers[q.id] ?? "").trim().length > 0) &&
+    conflicts.every((c) => (answers[c.id] ?? "").trim().length > 0);
+
+  function handleBuild() {
+    if (!report) return;
+    // Map analyst's choices/answers back into DealInputs where applicable.
+    let next = { ...state.inputs };
+    for (const c of report.conflicts) {
+      const sel = answers[c.id];
+      if (!sel || !c.inputs_key) continue;
+      next = applyOneRawValue(next, c.inputs_key, sel);
+    }
+    for (const q of report.questions) {
+      const ans = answers[q.id];
+      if (!ans || !q.inputs_key) continue;
+      next = applyOneRawValue(next, q.inputs_key, ans);
+    }
+    setInputs(next);
+    onNext();
+  }
 
   return (
     <div className="space-y-6">
-      {/* File upload — drag & drop */}
+      {/* === INTAKE INPUTS === */}
       <Card>
-        <CardBody className="space-y-3">
-          <div className="flex items-center gap-2">
-            <FacgChip icon={Upload}>Upload Deal Documents</FacgChip>
-          </div>
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragActive(true);
-            }}
-            onDragLeave={() => setDragActive(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragActive(false);
-              if (e.dataTransfer.files.length > 0) handleFiles(e.dataTransfer.files);
-            }}
-            className={`rounded-xl border-2 border-dashed px-6 py-8 text-center transition-colors ${
-              dragActive ? "border-accent bg-accent-soft/20" : "border-border bg-background/40"
-            }`}
-          >
-            <Upload className="mx-auto h-6 w-6 text-muted" />
-            <p className="mt-2 text-sm text-white">
-              Drag & drop PDF, Excel, Word, or PowerPoint files
+        <div
+          className="flex items-center gap-2 rounded-t-xl px-5 py-3"
+          style={{ backgroundColor: FACG_NAVY }}
+        >
+          <Brain className="h-4 w-4 text-white" />
+          <h3 className="flex-1 text-sm font-semibold uppercase tracking-wide text-white">
+            AI Intake Agent
+          </h3>
+          <span className="hidden sm:inline text-[10px] font-medium uppercase tracking-[0.15em] text-white/60">
+            Step 1
+          </span>
+        </div>
+        <CardBody className="space-y-5">
+          <p className="text-xs text-muted">
+            Drop everything you have — broker package, term sheet, MD email, your
+            own scribbles. The intake agent reads it all in one pass, flags
+            conflicts across documents, and tells you exactly what&apos;s still
+            missing before underwriting can start.
+          </p>
+
+          {/* Multi-file dropzone */}
+          <div>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">
+              Documents (any number)
             </p>
-            <p className="mt-1 text-xs text-muted">
-              or{" "}
-              <button
-                type="button"
-                onClick={() => fileRef.current?.click()}
-                className="font-medium text-accent underline-offset-2 hover:underline"
-              >
-                browse
-              </button>{" "}
-              — multiple files supported, 10MB each, 25MB total
-            </p>
-            <input
-              ref={fileRef}
-              type="file"
-              multiple
-              accept=".pdf,.docx,.xlsx,.xls,.pptx,.csv,.txt"
-              onChange={(e) => e.target.files && handleFiles(e.target.files)}
-              className="hidden"
-              disabled={extracting}
-            />
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragActive(true);
+              }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragActive(false);
+                if (e.dataTransfer.files.length > 0)
+                  addFiles(e.dataTransfer.files);
+              }}
+              className={`rounded-xl border-2 border-dashed px-6 py-7 text-center transition-colors ${
+                dragActive
+                  ? "border-accent bg-accent-soft/20"
+                  : "border-border bg-background/40"
+              }`}
+            >
+              <Upload className="mx-auto h-6 w-6 text-muted" />
+              <p className="mt-2 text-sm text-white">
+                Drag &amp; drop PDFs, Excel, Word, PowerPoint, or images
+              </p>
+              <p className="mt-1 text-xs text-muted">
+                or{" "}
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  className="font-medium text-accent underline-offset-2 hover:underline"
+                  disabled={analyzing}
+                >
+                  browse
+                </button>{" "}
+                — no limit on number of files, 10 MB each, 40 MB total
+              </p>
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                accept=".pdf,.docx,.xlsx,.xls,.pptx,.csv,.txt,image/*"
+                onChange={(e) => {
+                  if (e.target.files) addFiles(e.target.files);
+                  // allow re-selecting same file later
+                  e.target.value = "";
+                }}
+                className="hidden"
+                disabled={analyzing}
+              />
+            </div>
+
+            {files.length > 0 && (
+              <ul className="mt-3 space-y-1.5">
+                {files.map((f, i) => (
+                  <li
+                    key={`${f.name}-${i}`}
+                    className="flex items-center gap-2 rounded-lg border border-border bg-background/60 px-3 py-1.5 text-xs"
+                  >
+                    <FileIconForType file={f} />
+                    <span className="flex-1 truncate text-white/90">
+                      {f.name}
+                    </span>
+                    <span className="text-muted tabular-nums">
+                      {(f.size / 1024).toFixed(0)} KB
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeFile(i)}
+                      disabled={analyzing}
+                      className="rounded p-0.5 text-muted hover:bg-elevated hover:text-red-300"
+                      title="Remove file"
+                      aria-label={`Remove ${f.name}`}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
-          {extracting && (
-            <div className="flex items-center gap-2 text-sm text-muted">
-              <Loader2 className="h-4 w-4 animate-spin text-accent" />
-              Analyzing uploaded files…
+
+          {/* Email paste */}
+          <FieldShell label="Paste the email from your MD">
+            <div className="relative">
+              <Mail className="pointer-events-none absolute left-3 top-3 h-3.5 w-3.5 text-muted" />
+              <textarea
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                rows={4}
+                placeholder="From: Steve Kirchner &lt;…&gt;
+Subject: Whitfield 221(d)(4) — initial look
+…"
+                disabled={analyzing}
+                className={`${inputClass} pl-9 font-mono text-[12px] leading-relaxed resize-y`}
+              />
+            </div>
+          </FieldShell>
+
+          {/* Free-text blurb */}
+          <FieldShell label="Describe the deal in your own words">
+            <div className="relative">
+              <MessageSquare className="pointer-events-none absolute left-3 top-3 h-3.5 w-3.5 text-muted" />
+              <textarea
+                value={blurb}
+                onChange={(e) => setBlurb(e.target.value)}
+                rows={3}
+                placeholder="212-unit garden-style workforce deal in Lakeland FL, 221(d)(4) take-out, hard costs ~$32M, sponsor has $4M into the land already…"
+                disabled={analyzing}
+                className={`${inputClass} pl-9 resize-y`}
+              />
+            </div>
+          </FieldShell>
+
+          {/* Analyze button + status */}
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <span className="text-xs text-muted">
+              All inputs are synthesized in a single Claude pass. ~30-60 seconds.
+            </span>
+            <FacgButton onClick={handleAnalyze} disabled={analyzing}>
+              {analyzing ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" /> Analyzing
+                  everything…
+                </>
+              ) : (
+                <>
+                  <Sparkles className="h-4 w-4" /> Analyze Everything
+                </>
+              )}
+            </FacgButton>
+          </div>
+
+          {analyzeError && <p className="text-sm text-red-400">{analyzeError}</p>}
+          {analyzing && (
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+              Reading documents, cross-referencing across sources, flagging
+              gaps…
             </div>
           )}
-          {extractError && (
-            <p className="text-sm text-red-400">{extractError}</p>
-          )}
-          {extractNotes && (
+          {analyzeNotes && (
             <div
               className="flex items-start gap-2 rounded-lg border px-3 py-2 text-xs leading-relaxed"
               style={{
@@ -517,156 +684,354 @@ function Step1Intake({
               }}
             >
               <Info className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
-              <span className="whitespace-pre-line">{extractNotes}</span>
+              <span className="whitespace-pre-line">{analyzeNotes}</span>
             </div>
           )}
         </CardBody>
       </Card>
 
-      <Collapsible icon={Building2} title="Project Overview" defaultOpen>
-        <Grid cols={3}>
-          <TextField label="Project Name" value={inputs.project_name} onChange={(v) => update("project_name", v)} />
-          <TextField label="Address" value={inputs.address} onChange={(v) => update("address", v)} />
-          <TextField label="City, State" value={inputs.city_state} onChange={(v) => update("city_state", v)} />
-          <SelectField
-            label="Asset Type"
-            value={inputs.asset_type}
-            onChange={(v) => update("asset_type", v as AssetType)}
-            options={ASSET_TYPES.map((t) => ({ value: t, label: t }))}
-          />
-          <SelectField
-            label="HUD Program"
-            value={inputs.hud_program}
-            onChange={(v) => update("hud_program", v as HudProgram)}
-            options={HUD_PROGRAMS.map((t) => ({ value: t, label: t }))}
-          />
-          <NumberField label="Total Units" value={inputs.total_units} onChange={(v) => update("total_units", v)} integer />
-          <NumberField label="Total Stories" value={inputs.total_stories} onChange={(v) => update("total_stories", v)} integer />
-          <NumberField label="Total Acres" value={inputs.total_acres} onChange={(v) => update("total_acres", v)} decimals={2} />
-          <NumberField label="Parking Spaces" value={inputs.parking_spaces} onChange={(v) => update("parking_spaces", v)} integer />
-          <NumberField label="Construction Period (months)" value={inputs.construction_months} onChange={(v) => update("construction_months", v)} integer />
-          <NumberField label="Stabilization Period (months)" value={inputs.stabilization_months} onChange={(v) => update("stabilization_months", v)} integer />
-        </Grid>
-      </Collapsible>
+      {/* === INTAKE REPORT === */}
+      {report && (
+        <>
+          {/* Section A — What I Found */}
+          <FacgPanel icon={CheckCircle2} title="A · What I Found">
+            {report.summary && (
+              <p className="mb-3 text-sm leading-relaxed text-white/85">
+                {report.summary}
+              </p>
+            )}
+            {report.found.length === 0 ? (
+              <p className="text-xs text-muted">
+                Nothing extractable was found in the upload. Add more sources
+                and re-analyze.
+              </p>
+            ) : (
+              <FoundTable found={report.found} />
+            )}
+            {report.files_processed.length > 0 && (
+              <p className="mt-3 text-[11px] text-muted">
+                Sources processed: {report.files_processed.join(" · ")}
+              </p>
+            )}
+          </FacgPanel>
 
-      <Collapsible icon={Layers} title="Unit Mix" defaultOpen>
-        <Grid cols={3}>
-          <NumberField label="Studio Count" value={inputs.studio_count} onChange={(v) => update("studio_count", v)} integer />
-          <NumberField label="Studio Avg SF" value={inputs.studio_sf} onChange={(v) => update("studio_sf", v)} integer />
-          <MoneyField label="Studio Monthly Rent" value={inputs.studio_rent} onChange={(v) => update("studio_rent", v)} />
-          <NumberField label="1BR Count" value={inputs.one_br_count} onChange={(v) => update("one_br_count", v)} integer />
-          <NumberField label="1BR Avg SF" value={inputs.one_br_sf} onChange={(v) => update("one_br_sf", v)} integer />
-          <MoneyField label="1BR Monthly Rent" value={inputs.one_br_rent} onChange={(v) => update("one_br_rent", v)} />
-          <NumberField label="2BR Count" value={inputs.two_br_count} onChange={(v) => update("two_br_count", v)} integer />
-          <NumberField label="2BR Avg SF" value={inputs.two_br_sf} onChange={(v) => update("two_br_sf", v)} integer />
-          <MoneyField label="2BR Monthly Rent" value={inputs.two_br_rent} onChange={(v) => update("two_br_rent", v)} />
-          <NumberField label="3BR Count" value={inputs.three_br_count} onChange={(v) => update("three_br_count", v)} integer />
-          <NumberField label="3BR Avg SF" value={inputs.three_br_sf} onChange={(v) => update("three_br_sf", v)} integer />
-          <MoneyField label="3BR Monthly Rent" value={inputs.three_br_rent} onChange={(v) => update("three_br_rent", v)} />
-        </Grid>
-        <LiveCalc
-          items={[
-            { label: "Units (from mix)", value: String(computed.total_units_from_mix) },
-            { label: "GPR (annual)", value: fmt$(computed.gross_potential_rent_annual) },
-          ]}
-        />
-      </Collapsible>
+          {/* Section B — Conflicts (only if any) */}
+          {report.conflicts.length > 0 && (
+            <FacgPanel
+              icon={AlertTriangle}
+              title="B · Conflicts & Discrepancies"
+            >
+              <p className="mb-3 text-xs text-muted">
+                Two sources disagree on these values. Pick the authoritative one
+                — it&apos;ll feed the model.
+              </p>
+              <div className="space-y-3">
+                {report.conflicts.map((c) => (
+                  <ConflictRow
+                    key={c.id}
+                    conflict={c}
+                    selected={answers[c.id] ?? ""}
+                    onSelect={(v) => patchAnswer(c.id, v)}
+                  />
+                ))}
+              </div>
+            </FacgPanel>
+          )}
 
-      <Collapsible icon={DollarIcon} title="Capital Structure" defaultOpen>
-        <Grid cols={3}>
-          <MoneyField label="HUD Loan Amount" value={inputs.hud_loan_amount} onChange={(v) => update("hud_loan_amount", v)} />
-          <PercentField label="HUD Note Rate" value={inputs.hud_note_rate} onChange={(v) => update("hud_note_rate", v)} />
-          <NumberField label="Amortization (years)" value={inputs.amortization_years} onChange={(v) => update("amortization_years", v)} integer />
-          <PercentField label="MIP Rate" value={inputs.mip_rate} onChange={(v) => update("mip_rate", v)} />
-          <MoneyField label="Land Value" value={inputs.land_value} onChange={(v) => update("land_value", v)} />
-          <MoneyField label="Hard Costs" value={inputs.hard_costs} onChange={(v) => update("hard_costs", v)} />
-          <MoneyField label="Soft Costs & Fees" value={inputs.soft_costs_fees} onChange={(v) => update("soft_costs_fees", v)} />
-          <MoneyField label="Financing & Carrying Costs" value={inputs.financing_carrying_costs} onChange={(v) => update("financing_carrying_costs", v)} />
-          <MoneyField label="BSPRA Amount" value={inputs.bspra_amount} onChange={(v) => update("bspra_amount", v)} />
-          <MoneyField label="Working Capital Escrow" value={inputs.working_capital_escrow} onChange={(v) => update("working_capital_escrow", v)} />
-          <MoneyField label="IOD Escrow" value={inputs.iod_escrow} onChange={(v) => update("iod_escrow", v)} />
-          <MoneyField label="Sponsor Funds Spent to Date" value={inputs.sponsor_funds_spent} onChange={(v) => update("sponsor_funds_spent", v)} />
-          <MoneyField label="Sponsor Cash to Close" value={inputs.sponsor_cash_to_close} onChange={(v) => update("sponsor_cash_to_close", v)} />
-          <MoneyField label="Bridge Loan Amount" value={inputs.bridge_loan_amount} onChange={(v) => update("bridge_loan_amount", v)} />
-          <PercentField label="Bridge Rate" value={inputs.bridge_rate} onChange={(v) => update("bridge_rate", v)} />
-          <NumberField label="Bridge Term (months)" value={inputs.bridge_term_months} onChange={(v) => update("bridge_term_months", v)} integer />
-        </Grid>
-        <div className="mt-3 flex items-start gap-2 rounded-lg border border-blue-500/30 bg-blue-500/5 px-3 py-2 text-xs text-blue-200">
-          <Info className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-blue-400" />
-          <span>
-            Bridge loan is a pre-development timing instrument and is excluded
-            from Total Project Cost. It will be retired at HUD construction
-            closing.
-          </span>
-        </div>
-        <LiveCalc
-          items={[
-            { label: "Total Project Cost", value: fmt$Short(computed.total_project_cost) },
-            { label: "LTC", value: fmtPct(computed.ltc_pct, 1) },
-            { label: "Cost / Unit", value: fmt$Short(computed.cost_per_unit) },
-          ]}
-        />
-      </Collapsible>
+          {/* Section C — Gap Questions (only if any) */}
+          {report.questions.length > 0 && (
+            <FacgPanel
+              icon={HelpCircle}
+              title="C · Questions Before I Proceed"
+            >
+              <p className="mb-3 text-xs text-muted">
+                Required questions are marked with a red dot. Optional
+                questions are answered when you can — they&apos;ll sharpen the
+                downstream analysis.
+              </p>
+              <div className="space-y-3">
+                {report.questions.map((q, i) => (
+                  <QuestionRow
+                    key={q.id}
+                    index={i + 1}
+                    question={q}
+                    answer={answers[q.id] ?? ""}
+                    onAnswer={(v) => patchAnswer(q.id, v)}
+                  />
+                ))}
+              </div>
+            </FacgPanel>
+          )}
 
-      <Collapsible icon={Settings2} title="Operating Assumptions" defaultOpen>
-        <Grid cols={3}>
-          <PercentField label="Vacancy & Coll. Loss" value={inputs.vacancy_collection_pct} onChange={(v) => update("vacancy_collection_pct", v)} />
-          <PercentField label="Property Management" value={inputs.property_mgmt_pct} onChange={(v) => update("property_mgmt_pct", v)} />
-          <MoneyField label="R&M & Turnover" value={inputs.rm_turnover} onChange={(v) => update("rm_turnover", v)} />
-          <MoneyField label="Common Area Utilities" value={inputs.common_area_utilities} onChange={(v) => update("common_area_utilities", v)} />
-          <MoneyField label="G&A" value={inputs.gna} onChange={(v) => update("gna", v)} />
-          <MoneyField label="Payroll" value={inputs.payroll} onChange={(v) => update("payroll", v)} />
-          <MoneyField label="Operations" value={inputs.operations} onChange={(v) => update("operations", v)} />
-          <MoneyField label="Insurance" value={inputs.insurance} onChange={(v) => update("insurance", v)} />
-          <MoneyField label="Replacement Reserves" value={inputs.replacement_reserves} onChange={(v) => update("replacement_reserves", v)} />
-          <MoneyField label="Ancillary Income" value={inputs.ancillary_income} onChange={(v) => update("ancillary_income", v)} />
-          <PercentField label="Rent Growth" value={inputs.rent_growth_pct} onChange={(v) => update("rent_growth_pct", v)} />
-          <PercentField label="Exit Cap Rate" value={inputs.exit_cap_rate} onChange={(v) => update("exit_cap_rate", v)} />
-          <MoneyField label="Property Tax (full)" value={inputs.property_tax} onChange={(v) => update("property_tax", v)} />
-          <PercentField label="Tax Abatement" value={inputs.tax_abatement_pct} onChange={(v) => update("tax_abatement_pct", v)} />
-        </Grid>
-        <LiveCalc
-          items={[
-            { label: "Total OpEx", value: fmt$Short(computed.operating_expenses) },
-            { label: "NOI", value: fmt$Short(computed.noi_stabilized) },
-            { label: "DSCR", value: fmtX(computed.dscr) },
-            { label: "Yield on Cost", value: fmtPct(computed.yield_on_cost_pct, 2) },
-          ]}
-        />
-      </Collapsible>
-
-      <Collapsible icon={ChartArea} title="AMI Rent Limits">
-        <Grid cols={3}>
-          <TextField label="Market" value={inputs.ami_market} onChange={(v) => update("ami_market", v)} />
-          <TextField label="Source" value={inputs.ami_source} onChange={(v) => update("ami_source", v)} />
-          <Spacer />
-          <MoneyField label="1BR — 80% AMI" value={inputs.ami_1br_80} onChange={(v) => update("ami_1br_80", v)} />
-          <MoneyField label="1BR — 100% AMI" value={inputs.ami_1br_100} onChange={(v) => update("ami_1br_100", v)} />
-          <MoneyField label="1BR — 120% AMI" value={inputs.ami_1br_120} onChange={(v) => update("ami_1br_120", v)} />
-          <MoneyField label="2BR — 80% AMI" value={inputs.ami_2br_80} onChange={(v) => update("ami_2br_80", v)} />
-          <MoneyField label="2BR — 100% AMI" value={inputs.ami_2br_100} onChange={(v) => update("ami_2br_100", v)} />
-          <MoneyField label="2BR — 120% AMI" value={inputs.ami_2br_120} onChange={(v) => update("ami_2br_120", v)} />
-        </Grid>
-      </Collapsible>
-
-      <Collapsible icon={UsersIcon} title="Model Oversight">
-        <Grid cols={3}>
-          <TextField label="Managing Director" value={inputs.managing_director} onChange={(v) => update("managing_director", v)} />
-          <TextField label="Analyst Name" value={inputs.analyst_name} onChange={(v) => update("analyst_name", v)} />
-          <DateField label="Date" value={inputs.date} onChange={(v) => update("date", v)} />
-        </Grid>
-      </Collapsible>
-
-      <NavRow>
-        <span className="text-xs text-muted">
-          {!canProceed && "Enter a project name and city/state to proceed."}
-        </span>
-        <FacgButton onClick={onNext} disabled={!canProceed}>
-          Proceed to Market Comparables <ArrowRight className="h-4 w-4" />
-        </FacgButton>
-      </NavRow>
+          {/* Build button */}
+          <NavRow>
+            <span className="text-xs text-muted">
+              {report.conflicts.length === 0 && requiredQs.length === 0
+                ? "No gaps — ready to build."
+                : !allRequiredAnswered
+                  ? "Resolve conflicts and answer required questions to proceed."
+                  : "All clear."}
+            </span>
+            <FacgButton onClick={handleBuild} disabled={!allRequiredAnswered}>
+              All questions answered — Build the Deal{" "}
+              <ArrowRight className="h-4 w-4" />
+            </FacgButton>
+          </NavRow>
+        </>
+      )}
     </div>
   );
+}
+
+// =============================================================
+// Intake report sub-components
+// =============================================================
+
+function FileIconForType({ file }: { file: File }) {
+  const t = (file.type || "").toLowerCase();
+  const name = file.name.toLowerCase();
+  let Icon = FileText;
+  if (t.startsWith("image/")) Icon = ImageIcon;
+  else if (t.includes("spreadsheet") || /\.(xlsx?|csv)$/.test(name))
+    Icon = FileSpreadsheet;
+  else if (t.includes("presentation") || name.endsWith(".pptx"))
+    Icon = Presentation;
+  return <Icon className="h-3.5 w-3.5 flex-shrink-0 text-accent" />;
+}
+
+const CONFIDENCE_STYLES: Record<
+  "HIGH" | "MEDIUM" | "LOW",
+  { dot: string; chip: string; label: string }
+> = {
+  HIGH: {
+    dot: "bg-emerald-400",
+    chip: "border-emerald-500/30 bg-emerald-500/10 text-emerald-200",
+    label: "HIGH",
+  },
+  MEDIUM: {
+    dot: "bg-amber-400",
+    chip: "border-amber-500/30 bg-amber-500/10 text-amber-200",
+    label: "MEDIUM",
+  },
+  LOW: {
+    dot: "bg-red-400",
+    chip: "border-red-500/30 bg-red-500/10 text-red-200",
+    label: "LOW",
+  },
+};
+
+function FoundTable({ found }: { found: IntakeReport["found"] }) {
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <table className="w-full text-sm">
+        <thead className="bg-elevated/60">
+          <tr>
+            <Th left>Field</Th>
+            <Th left>Value</Th>
+            <Th left>Source</Th>
+            <Th left>Confidence</Th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border">
+          {found.map((f, i) => {
+            const s = CONFIDENCE_STYLES[f.confidence];
+            return (
+              <tr key={i}>
+                <td className="px-3 py-2 align-top text-left">
+                  <div className="flex items-start gap-2">
+                    <span
+                      className={`mt-1.5 h-2 w-2 flex-shrink-0 rounded-full ${s.dot}`}
+                    />
+                    <span className="font-medium text-white">{f.label}</span>
+                  </div>
+                </td>
+                <td className="px-3 py-2 align-top tabular-nums text-white/90">
+                  {f.value}
+                </td>
+                <td className="px-3 py-2 align-top text-xs text-white/70">
+                  {f.source}
+                </td>
+                <td className="px-3 py-2 align-top">
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${s.chip}`}
+                  >
+                    {s.label}
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ConflictRow({
+  conflict,
+  selected,
+  onSelect,
+}: {
+  conflict: IntakeReport["conflicts"][number];
+  selected: string;
+  onSelect: (v: string) => void;
+}) {
+  const resolved = selected.length > 0;
+  return (
+    <div
+      className={`rounded-lg border px-3 py-3 ${
+        resolved
+          ? "border-emerald-500/30 bg-emerald-500/5"
+          : "border-amber-500/30 bg-amber-500/5"
+      }`}
+    >
+      <div className="flex items-start gap-2">
+        {resolved ? (
+          <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-400" />
+        ) : (
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-400" />
+        )}
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-white">{conflict.label}</p>
+          {conflict.recommendation && (
+            <p className="mt-0.5 text-[11px] italic text-muted">
+              Suggestion: {conflict.recommendation}
+            </p>
+          )}
+        </div>
+      </div>
+      <div className="mt-2.5 grid grid-cols-1 gap-2 sm:grid-cols-2">
+        {conflict.options.map((opt, i) => {
+          const isSelected = selected === opt.value;
+          return (
+            <button
+              key={i}
+              type="button"
+              onClick={() => onSelect(opt.value)}
+              className={`flex flex-col gap-0.5 rounded-lg border px-3 py-2 text-left transition-colors ${
+                isSelected
+                  ? "border-emerald-500 bg-emerald-500/15 text-white"
+                  : "border-border bg-background/40 text-white/85 hover:border-accent/50"
+              }`}
+            >
+              <span className="text-sm font-semibold tabular-nums">
+                {opt.value}
+              </span>
+              <span className="text-[10px] text-muted">{opt.source}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function QuestionRow({
+  index,
+  question,
+  answer,
+  onAnswer,
+}: {
+  index: number;
+  question: IntakeReport["questions"][number];
+  answer: string;
+  onAnswer: (v: string) => void;
+}) {
+  const answered = answer.trim().length > 0;
+  const isRequired = question.required;
+  return (
+    <div className="rounded-lg border border-border bg-background/40 p-3">
+      <div className="flex items-start gap-3">
+        <span
+          className="mt-0.5 inline-flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-white"
+          style={{ backgroundColor: FACG_NAVY }}
+        >
+          {index}
+        </span>
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-sm font-medium leading-snug text-white">
+              {question.question}
+            </p>
+            {isRequired && (
+              <span className="inline-flex items-center gap-1 rounded-md border border-red-500/40 bg-red-500/10 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-red-200">
+                <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+                Required
+              </span>
+            )}
+            {answered && (
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+            )}
+          </div>
+          {question.why && (
+            <p className="mt-0.5 text-[11px] italic text-muted">
+              Why it matters: {question.why}
+            </p>
+          )}
+          <input
+            type="text"
+            value={answer}
+            onChange={(e) => onAnswer(e.target.value)}
+            placeholder={isRequired ? "Required answer…" : "Optional answer…"}
+            className={`mt-2 w-full rounded-md border bg-background px-2 py-1.5 text-sm text-white placeholder:text-muted/70 focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent ${
+              isRequired && !answered ? "border-red-500/40" : "border-border"
+            }`}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================
+// Inputs coercion: map intake-extracted values back into DealInputs
+// =============================================================
+
+function coerceForInputsKey<K extends keyof DealInputs>(
+  key: K,
+  raw: unknown
+): DealInputs[K] | undefined {
+  const def = DEFAULT_INPUTS[key];
+  if (typeof def === "number") {
+    const n =
+      typeof raw === "number"
+        ? raw
+        : Number(String(raw ?? "").replace(/[$,%\s]/g, ""));
+    return (Number.isFinite(n) ? n : undefined) as DealInputs[K] | undefined;
+  }
+  if (typeof def === "string") {
+    if (typeof raw === "string") return raw.trim() as DealInputs[K];
+    if (typeof raw === "number") return String(raw) as DealInputs[K];
+    return undefined;
+  }
+  return undefined;
+}
+
+function applyFieldsToInputs(
+  current: DealInputs,
+  fields: Record<string, unknown>,
+  acceptedKeysOut: string[]
+): DealInputs {
+  const next = { ...current } as Record<string, unknown>;
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue;
+    if (!(k in DEFAULT_INPUTS)) continue;
+    const coerced = coerceForInputsKey(k as keyof DealInputs, v);
+    if (coerced === undefined) continue;
+    next[k] = coerced;
+    acceptedKeysOut.push(k);
+  }
+  return next as DealInputs;
+}
+
+function applyOneRawValue(
+  current: DealInputs,
+  key: keyof DealInputs,
+  raw: string
+): DealInputs {
+  const coerced = coerceForInputsKey(key, raw);
+  if (coerced === undefined) return current;
+  return { ...current, [key]: coerced };
 }
 
 // === Step 2: Comparables ===
@@ -1669,6 +2034,40 @@ function Step4StressTest({
 }
 
 // === Step 5: Generate ===
+// === Step 5 audience constants ===
+const PITCH_AUDIENCE_OPTIONS = [
+  { id: "internal", label: "Internal FACG Review" },
+  { id: "senior_debt", label: "Senior Debt Lender" },
+  { id: "mezzanine", label: "Mezzanine Lender" },
+  { id: "preferred_equity", label: "Preferred Equity Investor" },
+  { id: "common_equity", label: "Common Equity / JV Partner" },
+] as const;
+type PitchAudienceId = (typeof PITCH_AUDIENCE_OPTIONS)[number]["id"];
+
+const PROSPECTUS_OPTIONS = [
+  {
+    id: "senior_debt",
+    label: "Senior Debt Prospectus",
+    sub: "Credit-memo voice. Leads with LTC / LTV / DSCR and collateral coverage.",
+  },
+  {
+    id: "mezzanine",
+    label: "Mezzanine Prospectus",
+    sub: "Subordinate-debt voice. Full debt stack, intercreditor, mezz IRR + waterfall.",
+  },
+  {
+    id: "preferred_equity",
+    label: "Preferred Equity Prospectus",
+    sub: "Pref coupon, redemption timeline, distribution waterfall, downside recovery.",
+  },
+  {
+    id: "common_equity",
+    label: "Common Equity / JV Prospectus",
+    sub: "Equity-pitch voice. IRR, MOIC, promote, full upside / base / downside cases.",
+  },
+] as const;
+type ProspectusTypeId = (typeof PROSPECTUS_OPTIONS)[number]["id"];
+
 function Step5Generate({
   state,
   onBack,
@@ -1676,57 +2075,157 @@ function Step5Generate({
   state: WizardState;
   onBack: () => void;
 }) {
+  // Excel — single download
   const [excelLoading, setExcelLoading] = useState(false);
-  const [pptxLoading, setPptxLoading] = useState(false);
-  const [pdfLoading, setPdfLoading] = useState(false);
+
+  // Pitch deck — single download driven by audience dropdown
+  const [pitchAudience, setPitchAudience] =
+    useState<PitchAudienceId>("internal");
+  const [pitchLoading, setPitchLoading] = useState(false);
+
+  // Prospectus — 4 checkboxes, parallel downloads
+  const [prospectusSel, setProspectusSel] = useState<
+    Record<ProspectusTypeId, boolean>
+  >({
+    senior_debt: false,
+    mezzanine: false,
+    preferred_equity: false,
+    common_equity: false,
+  });
+  const [prospectusLoading, setProspectusLoading] = useState<
+    Record<ProspectusTypeId, boolean>
+  >({
+    senior_debt: false,
+    mezzanine: false,
+    preferred_equity: false,
+    common_equity: false,
+  });
+  const anyProspectusLoading =
+    Object.values(prospectusLoading).some(Boolean);
+  const selectedProspectusCount =
+    Object.values(prospectusSel).filter(Boolean).length;
+
   const [error, setError] = useState<string | null>(null);
 
-  async function downloadFile(
+  // Common payload reused by every download endpoint.
+  const commonBody = {
+    inputs: state.inputs,
+    underwriting: state.underwriting,
+    comparables: state.comparables,
+    stressTest: state.stressTest,
+    qa: state.qa,
+  };
+
+  async function downloadFromEndpoint(
     endpoint: string,
-    setLoading: (b: boolean) => void
-  ) {
-    setError(null);
-    setLoading(true);
-    try {
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          inputs: state.inputs,
-          underwriting: state.underwriting,
-          comparables: state.comparables,
-          stressTest: state.stressTest,
-          qa: state.qa,
-        }),
-      });
-      if (!res.ok) {
-        // Try to parse JSON error
-        let msg = `Generation failed (${res.status})`;
-        try {
-          const data = await res.json();
-          if (data?.error) msg = data.error;
-        } catch {
-          /* not JSON */
-        }
-        throw new Error(msg);
+    body: unknown,
+    fallbackName: string
+  ): Promise<void> {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      let msg = `Generation failed (${res.status})`;
+      try {
+        const data = await res.json();
+        if (data?.error) msg = data.error;
+      } catch {
+        /* not JSON */
       }
-      const blob = await res.blob();
-      const cd = res.headers.get("content-disposition") ?? "";
-      const match = cd.match(/filename="([^"]+)"/);
-      const filename = match ? match[1] : "deal-package";
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("content-disposition") ?? "";
+    const match = cd.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : fallbackName;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function downloadExcel() {
+    setError(null);
+    setExcelLoading(true);
+    try {
+      await downloadFromEndpoint(
+        "/api/generate-excel",
+        commonBody,
+        "FACG_Model.xlsx"
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Download failed.");
     } finally {
-      setLoading(false);
+      setExcelLoading(false);
     }
+  }
+
+  async function downloadPitchDeck() {
+    setError(null);
+    setPitchLoading(true);
+    try {
+      await downloadFromEndpoint(
+        "/api/generate-pitch-deck",
+        { ...commonBody, audience: pitchAudience },
+        "FACG_Pitch_Deck.pptx"
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Download failed.");
+    } finally {
+      setPitchLoading(false);
+    }
+  }
+
+  async function generateSelectedProspectuses() {
+    const selected = (
+      Object.keys(prospectusSel) as ProspectusTypeId[]
+    ).filter((id) => prospectusSel[id]);
+    if (selected.length === 0) return;
+
+    setError(null);
+    // Mark every selected one as loading up-front so the UI reflects the
+    // full batch, then fire them in parallel — each spawns its own
+    // browser-level download as soon as its blob lands.
+    setProspectusLoading((prev) => {
+      const next = { ...prev };
+      for (const id of selected) next[id] = true;
+      return next;
+    });
+
+    const errors: string[] = [];
+    await Promise.all(
+      selected.map(async (id) => {
+        try {
+          await downloadFromEndpoint(
+            "/api/generate-prospectus",
+            { ...commonBody, prospectus_type: id },
+            `FACG_${id}_Prospectus.pdf`
+          );
+        } catch (err) {
+          const label =
+            PROSPECTUS_OPTIONS.find((o) => o.id === id)?.label ?? id;
+          errors.push(
+            `${label}: ${err instanceof Error ? err.message : "failed"}`
+          );
+        } finally {
+          setProspectusLoading((prev) => ({ ...prev, [id]: false }));
+        }
+      })
+    );
+
+    if (errors.length > 0) {
+      setError(errors.join(" · "));
+    }
+  }
+
+  function toggleProspectus(id: ProspectusTypeId) {
+    setProspectusSel((prev) => ({ ...prev, [id]: !prev[id] }));
   }
 
   return (
@@ -1734,8 +2233,12 @@ function Step5Generate({
       <FacgPanel icon={Download} title="Generate Deal Package">
         <p className="mb-4 text-xs text-muted">
           All deal data from steps 1-4 will be packaged into the formats below.
+          Pitch decks and prospectuses can be tailored per audience — each
+          audience uses a different writing voice and emphasis.
         </p>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+
+        {/* Row 1 — Excel + Pitch Deck */}
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <DownloadCard
             icon={FileSpreadsheet}
             title="Excel Model (.xlsx)"
@@ -1743,27 +2246,29 @@ function Step5Generate({
             cta="Download Excel"
             disabled={excelLoading}
             loading={excelLoading}
-            onClick={() => downloadFile("/api/generate-excel", setExcelLoading)}
+            onClick={downloadExcel}
           />
-          <DownloadCard
-            icon={Presentation}
-            title="Pitch Deck (.pptx)"
-            sub="FACG branded presentation deck"
-            cta="Download PPTX"
-            disabled={pptxLoading}
-            loading={pptxLoading}
-            onClick={() => downloadFile("/api/generate-pitch-deck", setPptxLoading)}
-          />
-          <DownloadCard
-            icon={FileTextIcon}
-            title="Investor Prospectus (.pdf)"
-            sub="Full institutional offering memorandum"
-            cta="Download PDF"
-            disabled={pdfLoading}
-            loading={pdfLoading}
-            onClick={() => downloadFile("/api/generate-prospectus", setPdfLoading)}
+
+          <PitchDeckCard
+            audience={pitchAudience}
+            onChangeAudience={setPitchAudience}
+            loading={pitchLoading}
+            onDownload={downloadPitchDeck}
           />
         </div>
+
+        {/* Row 2 — Prospectus multi-select */}
+        <div className="mt-3">
+          <ProspectusSelectorCard
+            selections={prospectusSel}
+            loading={prospectusLoading}
+            onToggle={toggleProspectus}
+            onGenerate={generateSelectedProspectuses}
+            selectedCount={selectedProspectusCount}
+            anyLoading={anyProspectusLoading}
+          />
+        </div>
+
         {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
       </FacgPanel>
 
@@ -1848,6 +2353,176 @@ function DownloadCard({
   );
 }
 
+// Pitch deck card with audience dropdown above the download button.
+function PitchDeckCard({
+  audience,
+  onChangeAudience,
+  loading,
+  onDownload,
+}: {
+  audience: PitchAudienceId;
+  onChangeAudience: (a: PitchAudienceId) => void;
+  loading: boolean;
+  onDownload: () => void;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-background/40 p-4">
+      <div
+        className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg text-white"
+        style={{ backgroundColor: FACG_NAVY }}
+      >
+        <Presentation className="h-4 w-4" />
+      </div>
+      <h4 className="text-sm font-semibold text-white">Pitch Deck (.pptx)</h4>
+      <p className="mt-1 text-xs leading-snug text-muted">
+        FACG-branded presentation deck. Audience tag is stamped on the cover
+        and embedded in the file name.
+      </p>
+
+      <label className="mt-3 block">
+        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-muted">
+          Audience
+        </span>
+        <select
+          value={audience}
+          onChange={(e) => onChangeAudience(e.target.value as PitchAudienceId)}
+          disabled={loading}
+          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-white focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-60"
+        >
+          {PITCH_AUDIENCE_OPTIONS.map((opt) => (
+            <option key={opt.id} value={opt.id}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <button
+        type="button"
+        onClick={onDownload}
+        disabled={loading}
+        className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+        style={{ backgroundColor: FACG_RED }}
+      >
+        {loading ? (
+          <>
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
+          </>
+        ) : (
+          <>
+            <Download className="h-3.5 w-3.5" /> Download PPTX
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
+// Multi-select prospectus card. Each checkbox spawns its own download in
+// parallel when "Generate Selected Outputs" is clicked.
+function ProspectusSelectorCard({
+  selections,
+  loading,
+  onToggle,
+  onGenerate,
+  selectedCount,
+  anyLoading,
+}: {
+  selections: Record<ProspectusTypeId, boolean>;
+  loading: Record<ProspectusTypeId, boolean>;
+  onToggle: (id: ProspectusTypeId) => void;
+  onGenerate: () => void;
+  selectedCount: number;
+  anyLoading: boolean;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-background/40 p-4">
+      <div className="mb-3 flex items-start gap-3">
+        <div
+          className="flex h-9 w-9 items-center justify-center rounded-lg text-white"
+          style={{ backgroundColor: FACG_NAVY }}
+        >
+          <FileTextIcon className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h4 className="text-sm font-semibold text-white">
+            Investor Prospectus (.pdf)
+          </h4>
+          <p className="mt-1 text-xs leading-snug text-muted">
+            Pick one or more audiences. Each checked box generates a separate
+            audience-specific PDF in parallel — different system prompt, voice,
+            and emphasis per type.
+          </p>
+        </div>
+      </div>
+
+      <ul className="space-y-2">
+        {PROSPECTUS_OPTIONS.map((opt) => {
+          const checked = selections[opt.id];
+          const itemLoading = loading[opt.id];
+          return (
+            <li key={opt.id}>
+              <label
+                className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors ${
+                  checked
+                    ? "border-accent/50 bg-accent-soft/10"
+                    : "border-border bg-background/60 hover:border-accent/30"
+                } ${itemLoading ? "opacity-70" : ""}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => onToggle(opt.id)}
+                  disabled={anyLoading}
+                  className="mt-1 h-3.5 w-3.5 flex-shrink-0 rounded border-border bg-background text-accent focus:ring-accent disabled:cursor-not-allowed"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-white">
+                      {opt.label}
+                    </span>
+                    {itemLoading && (
+                      <Loader2 className="h-3 w-3 animate-spin text-accent" />
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-[11px] leading-snug text-muted">
+                    {opt.sub}
+                  </p>
+                </div>
+              </label>
+            </li>
+          );
+        })}
+      </ul>
+
+      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <span className="text-[11px] text-muted">
+          {selectedCount === 0
+            ? "Select at least one audience to proceed."
+            : `${selectedCount} audience${selectedCount === 1 ? "" : "s"} selected — each will download as a separate PDF.`}
+        </span>
+        <button
+          type="button"
+          onClick={onGenerate}
+          disabled={selectedCount === 0 || anyLoading}
+          className="inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
+          style={{ backgroundColor: FACG_RED }}
+        >
+          {anyLoading ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Generating…
+            </>
+          ) : (
+            <>
+              <Download className="h-3.5 w-3.5" /> Generate Selected Outputs
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // === Shared UI primitives ===
 function FacgChip({ icon: Icon, children }: { icon: React.ComponentType<{ className?: string }>; children: React.ReactNode }) {
   return (
@@ -1880,39 +2555,6 @@ function FacgPanel({
   );
 }
 
-function Collapsible({
-  icon: Icon,
-  title,
-  defaultOpen = false,
-  children,
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  title: string;
-  defaultOpen?: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  return (
-    <Card>
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 rounded-t-xl px-5 py-3 text-left"
-        style={{ backgroundColor: FACG_NAVY }}
-      >
-        <Icon className="h-4 w-4 text-white" />
-        <h3 className="flex-1 text-sm font-semibold uppercase tracking-wide text-white">{title}</h3>
-        {open ? (
-          <ChevronDown className="h-4 w-4 text-white" />
-        ) : (
-          <ChevronRight className="h-4 w-4 text-white" />
-        )}
-      </button>
-      {open && <CardBody>{children}</CardBody>}
-    </Card>
-  );
-}
-
 function NavRow({ children }: { children: React.ReactNode }) {
   return <div className="flex items-center justify-between gap-4">{children}</div>;
 }
@@ -1938,9 +2580,6 @@ function Grid({ cols, children }: { cols: 2 | 3; children: React.ReactNode }) {
       : "grid grid-cols-1 gap-4 sm:grid-cols-2";
   return <div className={cls}>{children}</div>;
 }
-function Spacer() {
-  return <div className="hidden lg:block" aria-hidden />;
-}
 
 function FieldShell({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -1952,126 +2591,6 @@ function FieldShell({ label, children }: { label: string; children: React.ReactN
 }
 const inputClass =
   "w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-white placeholder:text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-60";
-
-function TextField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <FieldShell label={label}>
-      <input type="text" value={value} onChange={(e) => onChange(e.target.value)} className={inputClass} />
-    </FieldShell>
-  );
-}
-function DateField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <FieldShell label={label}>
-      <input type="date" value={value} onChange={(e) => onChange(e.target.value)} className={inputClass} />
-    </FieldShell>
-  );
-}
-function SelectField({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  options: { value: string; label: string }[];
-}) {
-  return (
-    <FieldShell label={label}>
-      <select value={value} onChange={(e) => onChange(e.target.value)} className={inputClass}>
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </FieldShell>
-  );
-}
-function NumberField({
-  label,
-  value,
-  onChange,
-  integer,
-  decimals,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  integer?: boolean;
-  decimals?: number;
-}) {
-  return (
-    <FieldShell label={label}>
-      <input
-        type="number"
-        step={integer ? 1 : decimals ? Math.pow(10, -decimals) : "any"}
-        value={value === 0 ? "" : value}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          onChange(Number.isFinite(n) ? (integer ? Math.floor(n) : n) : 0);
-        }}
-        placeholder="0"
-        className={inputClass}
-      />
-    </FieldShell>
-  );
-}
-function MoneyField({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <FieldShell label={label}>
-      <div className="relative">
-        <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted">$</span>
-        <input
-          type="number"
-          step="any"
-          value={value === 0 ? "" : value}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            onChange(Number.isFinite(n) ? n : 0);
-          }}
-          placeholder="0"
-          className={`${inputClass} pl-6`}
-        />
-      </div>
-    </FieldShell>
-  );
-}
-function PercentField({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <FieldShell label={label}>
-      <div className="relative">
-        <input
-          type="number"
-          step="0.01"
-          value={value === 0 ? "" : value}
-          onChange={(e) => {
-            const n = Number(e.target.value);
-            onChange(Number.isFinite(n) ? n : 0);
-          }}
-          placeholder="0.00"
-          className={`${inputClass} pr-7`}
-        />
-        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted">%</span>
-      </div>
-    </FieldShell>
-  );
-}
-
-function LiveCalc({ items }: { items: { label: string; value: string }[] }) {
-  return (
-    <div className="mt-4 grid grid-cols-2 gap-3 rounded-lg border border-border bg-background/30 p-3 sm:grid-cols-4">
-      {items.map((it, i) => (
-        <div key={i}>
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">{it.label}</p>
-          <p className="mt-0.5 text-sm font-semibold tabular-nums text-white">{it.value}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
 
 function Stat({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
   return (
